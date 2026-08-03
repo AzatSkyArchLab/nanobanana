@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nano banana</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍌</text></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">🍌 <span>nano banana</span></div>
+  <div class="stats">
+    <span class="stat" id="stat-spend" title="Потрачено за всю историю в этом браузере">—</span>
+    <span class="stat" id="stat-credits" title="Остаток на балансе OpenRouter">—</span>
+    <button class="ghost" id="open-settings">Ключ и доступ</button>
+  </div>
+</header>
+
+<main>
+  <!-- ЛЕВАЯ КОЛОНКА: параметры и запуск -->
+  <section class="panel" id="composer">
+    <div class="field">
+      <label for="model">Модель</label>
+      <select id="model"></select>
+      <p class="hint" id="model-hint"></p>
+    </div>
+
+    <div class="field-row">
+      <div class="field">
+        <label for="aspect">Пропорции</label>
+        <select id="aspect"></select>
+      </div>
+      <div class="field">
+        <label for="resolution">Разрешение</label>
+        <select id="resolution"></select>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="prompt">Промпт</label>
+      <textarea id="prompt" rows="6" placeholder="Что сгенерировать. Если приложены референсы — опиши, что с ними сделать."></textarea>
+    </div>
+
+    <div class="field">
+      <label>Референсы <span class="counter" id="ref-counter"></span></label>
+      <div class="dropzone" id="dropzone" tabindex="0" role="button">
+        Перетащи файлы, вставь из буфера (⌘V) или нажми, чтобы выбрать
+      </div>
+      <input type="file" id="file-input" accept="image/*" multiple hidden>
+      <div class="refs" id="refs"></div>
+    </div>
+
+    <div class="actions">
+      <button class="primary" id="generate">Сгенерировать</button>
+      <button class="ghost" id="cancel" hidden>Отмена</button>
+    </div>
+    <p class="hint" id="estimate"></p>
+    <p class="status" id="status" role="status"></p>
+  </section>
+
+  <!-- ПРАВАЯ КОЛОНКА: результаты -->
+  <section class="gallery">
+    <div class="gallery-head">
+      <h2>История</h2>
+      <button class="ghost small" id="clear-history">Очистить</button>
+    </div>
+    <div class="grid" id="grid"></div>
+    <p class="empty" id="empty">Пока пусто. Сгенерированные картинки останутся здесь после перезагрузки.</p>
+  </section>
+</main>
+
+<!-- Настройки доступа -->
+<dialog id="settings">
+  <form method="dialog" class="dialog-body">
+    <h2>Доступ к API</h2>
+    <div class="field">
+      <label for="api-key">Ключ OpenRouter</label>
+      <input type="password" id="api-key" placeholder="sk-or-v1-..." autocomplete="off" spellcheck="false">
+      <p class="hint">
+        Ключ хранится только в localStorage этого браузера и уходит напрямую в openrouter.ai.
+        В репозиторий он не попадает. Создать или отозвать —
+        <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener">openrouter.ai/settings/keys</a>.
+      </p>
+    </div>
+    <details>
+      <summary>Свой прокси</summary>
+      <div class="field">
+        <label for="base-url">Базовый URL</label>
+        <input type="url" id="base-url" placeholder="https://openrouter.ai/api/v1" spellcheck="false">
+        <p class="hint">Понадобится, когда ключ переедет на сервер и страница станет публичной.</p>
+      </div>
+    </details>
+    <div class="dialog-actions">
+      <button class="ghost" value="cancel">Отмена</button>
+      <button class="primary" id="save-settings" value="save">Сохранить</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Просмотр результата -->
+<dialog id="viewer">
+  <div class="viewer-body">
+    <img id="viewer-img" alt="">
+    <div class="viewer-side">
+      <p class="viewer-prompt" id="viewer-prompt"></p>
+      <dl class="viewer-meta" id="viewer-meta"></dl>
+      <div class="viewer-refs" id="viewer-refs"></div>
+      <div class="viewer-actions">
+        <button class="primary" id="viewer-download">Скачать</button>
+        <button class="ghost" id="viewer-toref">В референсы</button>
+        <button class="ghost" id="viewer-repeat">Повторить настройки</button>
+        <button class="ghost danger" id="viewer-delete">Удалить</button>
+      </div>
+    </div>
+  </div>
+  <button class="viewer-close" id="viewer-close" aria-label="Закрыть">×</button>
+</dialog>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
