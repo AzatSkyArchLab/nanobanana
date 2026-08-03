@@ -1,5 +1,6 @@
 import * as api from './api.js';
 import * as db from './db.js';
+import * as brush from './brush.js';
 import { toReference, blobToDataUrl, base64ToBlob, download, extFor, isImage } from './images.js';
 
 const $ = (id) => document.getElementById(id);
@@ -19,6 +20,12 @@ const el = {
   viewerMeta: $('viewer-meta'), viewerRefs: $('viewer-refs'), viewerClose: $('viewer-close'),
   viewerDownload: $('viewer-download'), viewerToRef: $('viewer-toref'),
   viewerRepeat: $('viewer-repeat'), viewerDelete: $('viewer-delete'),
+  viewerBrush: $('viewer-brush'),
+  brush: $('brush'), brushImg: $('brush-img'), brushCanvas: $('brush-canvas'),
+  brushSize: $('brush-size'), brushSizeVal: $('brush-size-val'),
+  brushMode: $('brush-mode'), brushUndo: $('brush-undo'), brushClear: $('brush-clear'),
+  brushPrompt: $('brush-prompt'), brushKeep: $('brush-keep'),
+  brushRun: $('brush-run'), brushCancel: $('brush-cancel'), brushStatus: $('brush-status'),
 };
 
 // Приблизительное число выходных токенов на картинку у моделей с потокенной
@@ -237,7 +244,14 @@ function renderRefs() {
     btn.textContent = '×';
     btn.title = 'Убрать';
     btn.addEventListener('click', () => removeRef(ref.key));
-    div.append(img, btn);
+
+    const pencil = document.createElement('button');
+    pencil.className = 'edit';
+    pencil.textContent = '✎';
+    pencil.title = 'Исправить кистью';
+    pencil.addEventListener('click', () => openBrush(ref.blob));
+
+    div.append(img, pencil, btn);
     return div;
   }));
   const cap = maxRefs();
@@ -330,6 +344,114 @@ async function generate() {
   }
 }
 
+/* ── Кисть: локальная правка ───────────────────────────── */
+
+/** Ближайшая к картинке пропорция из тех, что принимает модель. */
+function closestAspect(width, height) {
+  if (el.aspect.disabled) return undefined;
+  const target = Math.log(width / height);
+  let best = null;
+  for (const o of el.aspect.options) {
+    if (o.value === 'auto') continue;
+    const [w, h] = o.value.split(':').map(Number);
+    const d = Math.abs(Math.log(w / h) - target);
+    if (!best || d < best.d) best = { value: o.value, d };
+  }
+  return best?.value;
+}
+
+async function openBrush(blob) {
+  if (maxRefs() < 2) {
+    say('Кисть требует модель, принимающую хотя бы два референса. Выбери Nano Banana.', 'error');
+    return;
+  }
+  el.brushStatus.textContent = '';
+  el.brushStatus.className = 'status';
+  el.brushPrompt.value = '';
+  brush.setErase(false);
+  el.brushMode.textContent = 'Ластик';
+  el.brushMode.classList.remove('active');
+  el.viewer.close();
+  el.brush.showModal();
+  await brush.load(blob);
+}
+
+async function runBrush() {
+  const text = el.brushPrompt.value.trim();
+  if (brush.isEmpty()) { el.brushStatus.textContent = 'Сначала закрась область.'; el.brushStatus.className = 'status error'; return; }
+  if (!text) { el.brushStatus.textContent = 'Опиши, что должно быть в этой области.'; el.brushStatus.className = 'status error'; el.brushPrompt.focus(); return; }
+  if (!api.getKey()) { el.brushStatus.textContent = 'Нет ключа OpenRouter.'; el.brushStatus.className = 'status error'; return; }
+
+  const model = currentModel();
+  const { width, height } = brush.dimensions();
+  const resolution = el.resolution.disabled ? undefined : el.resolution.value;
+
+  state.inflight = new AbortController();
+  el.brushRun.disabled = true;
+  el.brushStatus.textContent = 'Исправляю…';
+  el.brushStatus.className = 'status busy';
+
+  try {
+    const [original, annotated] = await Promise.all([brush.buildOriginal(), brush.buildAnnotated()]);
+    const references = await Promise.all([original, annotated].map(blobToDataUrl));
+    const started = Date.now();
+
+    const res = await api.generate({
+      model: model.id,
+      prompt: brush.buildPrompt(text),
+      references,
+      aspectRatio: closestAspect(width, height),
+      resolution,
+      signal: state.inflight.signal,
+    });
+
+    const image = res?.data?.[0];
+    if (!image?.b64_json) throw new Error('Ответ без изображения.');
+
+    let out = base64ToBlob(image.b64_json, image.media_type || 'image/png');
+    let outType = image.media_type || 'image/png';
+    if (el.brushKeep.checked) {
+      out = await brush.compose(out);   // снаружи маски остаётся оригинал
+      outType = 'image/png';
+    }
+
+    const record = {
+      id: `${started}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: started,
+      model: model.id,
+      modelName: model.name,
+      prompt: text,
+      kind: 'brush',
+      composed: el.brushKeep.checked,
+      aspect: closestAspect(width, height),
+      resolution,
+      cost: res.usage?.cost ?? 0,
+      seconds: Math.round((Date.now() - started) / 1000),
+      outType,
+      out,
+      refs: [annotated],
+    };
+
+    await db.add(record);
+    state.history.unshift(record);
+    renderHistory();
+    updateEstimate();
+    el.brushStatus.textContent = '';
+    el.brushStatus.className = 'status';
+    el.brush.close();
+    say(`Правка готова за ${record.seconds} с · ${money(record.cost)}`);
+    openViewer(record.id);
+    refreshCredits();
+    setTimeout(refreshCredits, 30000);
+  } catch (e) {
+    el.brushStatus.textContent = e.name === 'AbortError' ? 'Отменено.' : (e.message || 'Не получилось.');
+    el.brushStatus.className = 'status error';
+  } finally {
+    state.inflight = null;
+    el.brushRun.disabled = false;
+  }
+}
+
 /* ── История ───────────────────────────────────────────── */
 
 function renderHistory() {
@@ -351,7 +473,8 @@ function renderHistory() {
     p.textContent = rec.prompt;
     const small = document.createElement('small');
     const when = new Date(rec.ts).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-    small.textContent = `${when} · ${money(rec.cost)}${rec.refs.length ? ` · ${rec.refs.length} реф.` : ''}`;
+    const tail = rec.kind === 'brush' ? ' · кисть' : (rec.refs.length ? ` · ${rec.refs.length} реф.` : '');
+    small.textContent = `${when} · ${money(rec.cost)}${tail}`;
     cap.append(p, small);
 
     card.append(img, cap);
@@ -504,6 +627,28 @@ function bind() {
     if (viewing) download(viewing.out, `nanobanana-${viewing.ts}.${extFor(viewing.outType)}`);
   });
   el.viewerToRef.addEventListener('click', useAsReference);
+  el.viewerBrush.addEventListener('click', () => { if (viewing) openBrush(viewing.out); });
+
+  brush.init({
+    canvas: el.brushCanvas,
+    image: el.brushImg,
+    sizeInput: el.brushSize,
+    sizeLabel: el.brushSizeVal,
+  });
+  el.brushSize.addEventListener('input', () => brush.setSize(Number(el.brushSize.value)));
+  el.brushUndo.addEventListener('click', brush.undo);
+  el.brushClear.addEventListener('click', brush.clear);
+  el.brushMode.addEventListener('click', () => {
+    brush.setErase(!brush.isErasing());
+    el.brushMode.classList.toggle('active', brush.isErasing());
+    el.brushMode.textContent = brush.isErasing() ? 'Кисть' : 'Ластик';
+  });
+  el.brushRun.addEventListener('click', runBrush);
+  el.brushCancel.addEventListener('click', () => el.brush.close());
+  el.brush.addEventListener('close', () => state.inflight?.abort());
+  el.brushPrompt.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') runBrush();
+  });
   el.viewerRepeat.addEventListener('click', repeatSettings);
   el.viewerDelete.addEventListener('click', deleteCurrent);
 

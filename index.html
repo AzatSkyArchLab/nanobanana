@@ -109,6 +109,7 @@
       <div class="viewer-refs" id="viewer-refs"></div>
       <div class="viewer-actions">
         <button class="primary" id="viewer-download">Скачать</button>
+        <button class="ghost" id="viewer-brush">Исправить кистью</button>
         <button class="ghost" id="viewer-toref">В референсы</button>
         <button class="ghost" id="viewer-repeat">Повторить настройки</button>
         <button class="ghost danger" id="viewer-delete">Удалить</button>
@@ -116,6 +117,54 @@
     </div>
   </div>
   <button class="viewer-close" id="viewer-close" aria-label="Закрыть">×</button>
+</dialog>
+
+<!-- Кисть: локальная правка отмеченной области -->
+<dialog id="brush">
+  <div class="brush-body">
+    <div class="brush-stage">
+      <img id="brush-img" alt="">
+      <canvas id="brush-canvas"></canvas>
+    </div>
+    <div class="brush-side">
+      <h2>Исправить область</h2>
+      <p class="hint">
+        Закрась то, что нужно изменить — целиком. Незакрашенное сохранится
+        как есть, даже если это остаток того же объекта.
+      </p>
+
+      <div class="field">
+        <label for="brush-size">Кисть <span class="counter" id="brush-size-val"></span></label>
+        <input type="range" id="brush-size" min="4" max="400" step="2">
+      </div>
+
+      <div class="brush-tools">
+        <button class="ghost small" id="brush-mode">Ластик</button>
+        <button class="ghost small" id="brush-undo">Отменить</button>
+        <button class="ghost small" id="brush-clear">Сбросить</button>
+      </div>
+
+      <div class="field">
+        <label for="brush-prompt">Что должно быть в этой области</label>
+        <textarea id="brush-prompt" rows="4" placeholder="Убрать надпись. Заменить фон на дерево. Добавить тень."></textarea>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" id="brush-keep" checked>
+        Оставить остальное нетронутым
+      </label>
+      <p class="hint">
+        Результат склеивается с оригиналом по маске, поэтому за пределами закраски
+        пиксели не меняются. Выключи, если правка должна выходить за границу выделения.
+      </p>
+
+      <div class="brush-actions">
+        <button class="primary" id="brush-run">Исправить</button>
+        <button class="ghost" id="brush-cancel">Отмена</button>
+      </div>
+      <p class="status" id="brush-status" role="status"></p>
+    </div>
+  </div>
 </dialog>
 
 <script type="module" src="js/app.js"></script>

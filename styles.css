@@ -233,6 +233,69 @@ details .field { margin-top: 10px; }
 .viewer-refs { display: flex; flex-wrap: wrap; gap: 6px; }
 .viewer-refs img { width: 44px; height: 44px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); }
 .viewer-actions { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
+/* ── Кисть ─────────────────────────────────────────────── */
+.brush-body { display: grid; grid-template-columns: minmax(0, 1fr) 300px; }
+@media (max-width: 820px) { .brush-body { grid-template-columns: 1fr; } }
+
+.brush-stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  background: #000;
+  min-height: 200px;
+}
+.brush-stage img {
+  display: block;
+  max-width: 100%;
+  max-height: 82vh;
+  grid-area: 1 / 1;
+}
+.brush-stage canvas {
+  grid-area: 1 / 1;
+  max-width: 100%;
+  max-height: 82vh;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.brush-side {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-left: 1px solid var(--line);
+  overflow-y: auto;
+  max-height: 82vh;
+}
+.brush-side h2 { margin: 0; font-size: 15px; }
+.brush-tools { display: flex; gap: 6px; }
+.brush-tools button { flex: 1; }
+.brush-tools button.active { border-color: var(--accent); color: var(--accent); }
+.brush-actions { display: flex; gap: 8px; margin-top: auto; }
+.brush-actions .primary { flex: 1; }
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.check input { accent-color: var(--accent); }
+
+input[type=range] { width: 100%; accent-color: var(--accent); }
+
+/* Карандаш на миниатюре референса — вход в кисть для загруженной картинки */
+.ref .edit {
+  top: 2px;
+  right: 22px;
+  font-size: 10px;
+  line-height: 18px;
+}
+
 .viewer-close {
   position: absolute;
   top: 10px; right: 12px;
