@@ -19,6 +19,52 @@ export function base64ToBlob(b64, type = 'image/png') {
   return new Blob([bytes], { type });
 }
 
+const SVG_TYPE = 'image/svg+xml';
+
+/**
+ * Векторные модели (Recraft *-vector) отдают SVG. В <img> он рисуется, но
+ * createImageBitmap его не декодирует — значит ни кисть, ни отправка обратно
+ * референсом с ним не работают. Поэтому SVG заранее переводится в растр.
+ * Растровые блобы возвращаются как есть.
+ */
+export async function rasterize(blob, edge = 1536) {
+  if (blob.type !== SVG_TYPE) return blob;
+
+  const doc = new DOMParser().parseFromString(await blob.text(), SVG_TYPE);
+  const svg = doc.documentElement;
+  const box = (svg.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
+
+  let w = parseFloat(svg.getAttribute('width'));
+  let h = parseFloat(svg.getAttribute('height'));
+  if (!(w > 0) || !(h > 0)) {
+    [w, h] = box.length === 4 && box[2] > 0 ? [box[2], box[3]] : [1024, 1024];
+  }
+
+  // Без явных размеров браузер рисует SVG в 150 px — задаём рабочий кадр сами.
+  const k = edge / Math.max(w, h);
+  const rw = Math.max(1, Math.round(w * k));
+  const rh = Math.max(1, Math.round(h * k));
+  svg.setAttribute('width', String(rw));
+  svg.setAttribute('height', String(rh));
+
+  const url = URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(doc)], { type: SVG_TYPE }));
+  try {
+    const img = await new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => rej(new Error('SVG не отрисовался'));
+      i.src = url;
+    });
+    const c = document.createElement('canvas');
+    c.width = rw;
+    c.height = rh;
+    c.getContext('2d').drawImage(img, 0, 0, rw, rh);   // PNG сохранит прозрачность
+    return await new Promise((res) => c.toBlob(res, 'image/png'));
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 function loadBitmap(blob) {
   if (window.createImageBitmap) return createImageBitmap(blob);
   return new Promise((resolve, reject) => {
@@ -35,7 +81,9 @@ function loadBitmap(blob) {
  * это заметно ускоряет запрос и снижает плату за входные токены.
  * PNG остаётся PNG (важно для прозрачности), остальное уходит в JPEG.
  */
-export async function toReference(file) {
+export async function toReference(source) {
+  const name = source.name || 'reference';
+  const file = await rasterize(source, MAX_EDGE);
   const isPng = file.type === 'image/png';
   const bmp = await loadBitmap(file);
   const { width, height } = bmp;
@@ -43,7 +91,7 @@ export async function toReference(file) {
 
   if (scale === 1 && file.size <= PASS_THROUGH_BYTES) {
     if (bmp.close) bmp.close();
-    return { blob: file, width, height, name: file.name || 'reference' };
+    return { blob: file, width, height, name };
   }
 
   const w = Math.round(width * scale);
@@ -58,7 +106,7 @@ export async function toReference(file) {
 
   const type = isPng ? 'image/png' : 'image/jpeg';
   const blob = await new Promise((res) => canvas.toBlob(res, type, 0.92));
-  return { blob: blob || file, width: w, height: h, name: file.name || 'reference' };
+  return { blob: blob || file, width: w, height: h, name };
 }
 
 export function download(blob, filename) {

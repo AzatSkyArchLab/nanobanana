@@ -8,6 +8,8 @@
 // Модель всё равно перерисовывает кадр целиком, поэтому итог склеивается
 // с оригиналом по той же маске: снаружи закраски пиксели остаются прежними.
 
+import { rasterize } from './images.js';
+
 const MARK_COLOR = '#ff00ff';
 const MARK_ALPHA = 0.45;
 const MAX_EDGE = 2048;        // потолок рабочего разрешения маски
@@ -66,7 +68,9 @@ export function init(elements) {
 }
 
 /** Готовит редактор к работе с картинкой. */
-export async function load(blob) {
+export async function load(source) {
+  // SVG от векторных моделей createImageBitmap не декодирует — растеризуем.
+  const blob = await rasterize(source, MAX_EDGE);
   const bmp = await createImageBitmap(blob);
   const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
   state.bitmap = bmp;

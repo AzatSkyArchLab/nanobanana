@@ -523,16 +523,16 @@ function openViewer(id) {
   el.viewer.showModal();
 }
 
-function useAsReference() {
+async function useAsReference() {
   if (!viewing) return;
   const cap = maxRefs();
   if (state.refs.length >= cap) { say(`Лимит референсов — ${cap}.`, 'error'); return; }
-  state.refs.push({
-    key: ++refKey,
-    blob: viewing.out,
-    url: URL.createObjectURL(viewing.out),
-    name: 'result',
-  });
+
+  // Через toReference, а не напрямую: у векторных моделей результат — SVG,
+  // его нужно растеризовать, иначе он уйдёт в запрос неподъёмным для модели.
+  const { blob } = await toReference(new File([viewing.out], 'result', { type: viewing.outType }));
+  state.refs.push({ key: ++refKey, blob, url: URL.createObjectURL(blob), name: 'result' });
+
   renderRefs();
   el.viewer.close();
   el.prompt.focus();
