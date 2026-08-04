@@ -134,6 +134,11 @@
       </p>
 
       <div class="field">
+        <label>Цвет пометки</label>
+        <div class="swatches" id="brush-colors"></div>
+      </div>
+
+      <div class="field">
         <label for="brush-size">Кисть <span class="counter" id="brush-size-val"></span></label>
         <input type="range" id="brush-size" min="4" max="400" step="2">
       </div>
@@ -145,8 +150,9 @@
       </div>
 
       <div class="field">
-        <label for="brush-prompt">Что должно быть в этой области</label>
-        <textarea id="brush-prompt" rows="4" placeholder="Убрать надпись. Заменить фон на дерево. Добавить тень."></textarea>
+        <label for="brush-prompt">Что сделать с закрашенным</label>
+        <textarea id="brush-prompt" rows="4" placeholder="Пурпурное замени на дерево. Голубое убери."></textarea>
+        <p class="hint" id="brush-legend"></p>
       </div>
 
       <label class="check">

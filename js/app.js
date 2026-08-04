@@ -24,6 +24,7 @@ const el = {
   brush: $('brush'), brushImg: $('brush-img'), brushCanvas: $('brush-canvas'),
   brushSize: $('brush-size'), brushSizeVal: $('brush-size-val'),
   brushMode: $('brush-mode'), brushUndo: $('brush-undo'), brushClear: $('brush-clear'),
+  brushColors: $('brush-colors'), brushLegend: $('brush-legend'),
   brushPrompt: $('brush-prompt'), brushKeep: $('brush-keep'),
   brushRun: $('brush-run'), brushCancel: $('brush-cancel'), brushStatus: $('brush-status'),
 };
@@ -375,6 +376,34 @@ function closestAspect(width, height) {
   return best?.value;
 }
 
+function buildSwatches() {
+  el.brushColors.replaceChildren(...brush.PALETTE.map((colour) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.style.background = colour.hex;
+    b.title = colour.ru;
+    b.dataset.key = colour.key;
+    b.addEventListener('click', () => selectColour(colour.key));
+    return b;
+  }));
+}
+
+function selectColour(key) {
+  brush.setColor(key);
+  brush.setErase(false);
+  el.brushMode.textContent = 'Ластик';
+  el.brushMode.classList.remove('active');
+  for (const b of el.brushColors.children) b.classList.toggle('active', b.dataset.key === key);
+}
+
+/** Подсказка, какими словами ссылаться на закрашенное. */
+function updateLegend() {
+  const used = brush.usedColors();
+  el.brushLegend.textContent = used.length
+    ? `Закрашено: ${used.map((c) => c.ru).join(', ')}. Ссылайся на цвета в тексте.`
+    : '';
+}
+
 async function openBrush(blob) {
   // Кисть шлёт две картинки: оригинал и его размеченную копию.
   if (maxRefs() < 2) {
@@ -387,12 +416,11 @@ async function openBrush(blob) {
   el.brushStatus.textContent = '';
   el.brushStatus.className = 'status';
   el.brushPrompt.value = '';
-  brush.setErase(false);
-  el.brushMode.textContent = 'Ластик';
-  el.brushMode.classList.remove('active');
   el.viewer.close();
   el.brush.showModal();
   await brush.load(blob);
+  selectColour(brush.PALETTE[0].key);
+  updateLegend();
 }
 
 async function runBrush() {
@@ -429,8 +457,9 @@ async function runBrush() {
 
     let out = base64ToBlob(image.b64_json, image.media_type || 'image/png');
     let outType = image.media_type || 'image/png';
+    let fit = null;
     if (el.brushKeep.checked) {
-      out = await brush.compose(out);   // снаружи маски остаётся оригинал
+      ({ blob: out, fit } = await brush.compose(out));   // снаружи маски остаётся оригинал
       outType = 'image/png';
     }
 
@@ -458,7 +487,10 @@ async function runBrush() {
     el.brushStatus.textContent = '';
     el.brushStatus.className = 'status';
     el.brush.close();
-    say(`Правка готова за ${record.seconds} с · ${money(record.cost)}`);
+    const drift = fit && (Math.abs(fit.tx) > 1 || Math.abs(fit.ty) > 1 || fit.scale !== 1)
+      ? ` · кадр совмещён (сдвиг ${Math.round(fit.tx)}/${Math.round(fit.ty)} px, масштаб ${fit.scale.toFixed(2)})`
+      : '';
+    say(`Правка готова за ${record.seconds} с · ${money(record.cost)}${drift}`);
     openViewer(record.id);
     refreshCredits();
     setTimeout(refreshCredits, 30000);
@@ -654,9 +686,11 @@ function bind() {
     sizeInput: el.brushSize,
     sizeLabel: el.brushSizeVal,
   });
+  buildSwatches();
   el.brushSize.addEventListener('input', () => brush.setSize(Number(el.brushSize.value)));
-  el.brushUndo.addEventListener('click', brush.undo);
-  el.brushClear.addEventListener('click', brush.clear);
+  el.brushUndo.addEventListener('click', () => { brush.undo(); updateLegend(); });
+  el.brushClear.addEventListener('click', () => { brush.clear(); updateLegend(); });
+  el.brushCanvas.addEventListener('pointerup', updateLegend);
   el.brushMode.addEventListener('click', () => {
     brush.setErase(!brush.isErasing());
     el.brushMode.classList.toggle('active', brush.isErasing());
