@@ -99,7 +99,7 @@ async function loadModels() {
     for (const m of items) {
       const o = document.createElement('option');
       o.value = m.id;
-      o.textContent = m.name.replace(/^Google:\s*/, '');
+      o.textContent = shortName(m.name);
       g.appendChild(o);
     }
     return g;
@@ -189,6 +189,21 @@ function estimateCost(modelId, resolution) {
     return { value: cost * tokens, actual: false };
   }
   return null;
+}
+
+const shortName = (name) => name.replace(/^Google:\s*/, '');
+
+/**
+ * Сообщение на время ожидания. Скорость у моделей разная — от секунд
+ * у Riverflow Fast до минуты у Pro, — поэтому время берётся из истории
+ * этой же модели, как и оценка стоимости.
+ */
+function busyText(model) {
+  const seen = state.history.filter((r) => r.model === model.id && r.seconds > 0);
+  const name = shortName(model.name);
+  if (!seen.length) return `Запрос ушёл в «${name}». Может занять до минуты.`;
+  const avg = Math.round(seen.reduce((s, r) => s + r.seconds, 0) / seen.length);
+  return `Запрос ушёл в «${name}» — обычно ${avg} с.`;
 }
 
 function updateEstimate() {
@@ -296,7 +311,7 @@ async function generate() {
   state.inflight = new AbortController();
   setBusy(true);
   showPending(true);
-  say('Запрос ушёл. Nano Banana Pro может думать до минуты.', 'busy');
+  say(busyText(model), 'busy');
 
   try {
     const references = await Promise.all(state.refs.map((r) => blobToDataUrl(r.blob)));
@@ -361,8 +376,12 @@ function closestAspect(width, height) {
 }
 
 async function openBrush(blob) {
+  // Кисть шлёт две картинки: оригинал и его размеченную копию.
   if (maxRefs() < 2) {
-    say('Кисть требует модель, принимающую хотя бы два референса. Выбери Nano Banana.', 'error');
+    const model = currentModel();
+    const fits = state.models.filter((m) => (m.supported_parameters?.input_references?.max ?? 0) >= 2);
+    const hint = fits.slice(0, 2).map((m) => `«${shortName(m.name)}»`).join(' или ');
+    say(`Кисти нужны два референса, а «${shortName(model.name)}» принимает ${maxRefs()}. Подойдёт ${hint}.`, 'error');
     return;
   }
   el.brushStatus.textContent = '';
@@ -501,7 +520,7 @@ function openViewer(id) {
   el.viewerPrompt.textContent = rec.prompt;
 
   const rows = [
-    ['Модель', rec.modelName.replace(/^Google:\s*/, '')],
+    ['Модель', shortName(rec.modelName)],
     ['Формат', [rec.resolution, rec.aspect].filter(Boolean).join(' · ') || '—'],
     ['Стоимость', money(rec.cost)],
     ['Время', `${rec.seconds} с`],
