@@ -723,8 +723,31 @@ function bind() {
   });
 }
 
+/**
+ * GitHub Pages кеширует и сам index.html на 10 минут, поэтому свежая версия
+ * может не доехать до браузера. Сверяемся с version.json (мимо кеша) и один
+ * раз перезагружаемся: обычная перезагрузка перепрашивает документ у сервера.
+ */
+async function checkBuild() {
+  if (BUILD === 'dev') return;
+  try {
+    const res = await fetch(`version.json?t=${BUILD}`, { cache: 'no-store' });
+    const { build } = await res.json();
+    if (!build || build === BUILD) return;
+    if (sessionStorage.getItem('nb.reloadedFor') === build) {
+      say(`Загружена сборка ${BUILD}, на сервере ${build}. Обнови страницу с ⇧⌘R.`, 'error');
+      return;
+    }
+    sessionStorage.setItem('nb.reloadedFor', build);
+    location.reload();
+  } catch {
+    // Нет сети или файла — не повод мешать работе.
+  }
+}
+
 async function init() {
   $('build-id').textContent = BUILD;
+  checkBuild();
   bind();
   renderRefs();
   try {
