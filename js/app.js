@@ -1,7 +1,16 @@
-import * as api from './api.js';
-import * as db from './db.js';
-import * as brush from './brush.js';
-import { toReference, blobToDataUrl, base64ToBlob, download, extFor, isImage } from './images.js';
+// Версия берётся из адреса самого модуля и прокидывается во все импорты.
+// GitHub Pages отдаёт файлы с max-age=600: без этого браузер способен склеить
+// свежий index.html со старым кодом, и получается неработающая мешанина версий.
+const V = new URL(import.meta.url).search;
+export const BUILD = new URLSearchParams(V).get('v') || 'dev';
+
+const [api, db, brush, images] = await Promise.all([
+  import('./api.js' + V),
+  import('./db.js' + V),
+  import('./brush.js' + V),
+  import('./images.js' + V),
+]);
+const { toReference, blobToDataUrl, base64ToBlob, download, extFor, isImage } = images;
 
 const $ = (id) => document.getElementById(id);
 
@@ -715,6 +724,7 @@ function bind() {
 }
 
 async function init() {
+  $('build-id').textContent = BUILD;
   bind();
   renderRefs();
   try {

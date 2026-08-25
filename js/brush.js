@@ -8,8 +8,11 @@
 // Цвета выбраны чистые и в фотографиях почти не встречающиеся, чтобы модель
 // не путала пометку с содержимым сцены.
 
-import { rasterize } from './images.js';
-import { estimateAlignment } from './align.js';
+const V = new URL(import.meta.url).search;   // см. комментарий в app.js
+const [{ rasterize }, { estimateAlignment }] = await Promise.all([
+  import('./images.js' + V),
+  import('./align.js' + V),
+]);
 
 export const PALETTE = [
   { key: 'magenta', hex: '#ff00ff', en: 'magenta', ru: 'пурпурный' },
@@ -41,8 +44,14 @@ let layers = new Map();   // key -> canvas с белыми штрихами эт
 export function init(elements) {
   ui = elements;
 
+  // Если холст ещё не разложен, деление на нулевую ширину дало бы Infinity
+  // и мазок молча пропал бы — такую поломку потом не найти.
   const pos = (e) => {
     const r = ui.canvas.getBoundingClientRect();
+    if (!r.width || !r.height) {
+      console.warn('кисть: холст нулевого размера, штрих пропущен');
+      return null;
+    }
     return [
       (e.clientX - r.left) * (state.width / r.width),
       (e.clientY - r.top) * (state.height / r.height),
@@ -51,8 +60,10 @@ export function init(elements) {
 
   ui.canvas.addEventListener('pointerdown', (e) => {
     if (!state.bitmap) return;
+    const start = pos(e);
+    if (!start) return;
     ui.canvas.setPointerCapture(e.pointerId);
-    state.current = { size: state.size, erase: state.erase, color: state.color, points: [pos(e)] };
+    state.current = { size: state.size, erase: state.erase, color: state.color, points: [start] };
     state.strokes.push(state.current);
     stampDot(state.current, state.current.points[0]);
     render();
@@ -62,6 +73,7 @@ export function init(elements) {
     if (!state.current) return;
     const from = state.current.points[state.current.points.length - 1];
     const to = pos(e);
+    if (!to) return;
     state.current.points.push(to);
     // Дорисовываем только новый отрезок: полная перерисовка на каждое движение
     // означала бы аллокацию полноразмерного холста на кадр.
