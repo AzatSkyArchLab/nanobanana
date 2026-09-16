@@ -38,6 +38,7 @@ async function tx(mode, fn) {
 }
 
 export const add = (record) => tx('readwrite', (s) => s.add(record));
+export const put = (record) => tx('readwrite', (s) => s.put(record));
 export const remove = (id) => tx('readwrite', (s) => s.delete(id));
 export const clear = () => tx('readwrite', (s) => s.clear());
 

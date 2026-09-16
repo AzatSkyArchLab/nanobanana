@@ -22,7 +22,7 @@ const el = {
   generate: $('generate'), cancel: $('cancel'),
   estimate: $('estimate'), status: $('status'),
   grid: $('grid'), empty: $('empty'), clearHistory: $('clear-history'),
-  statSpend: $('stat-spend'), statCredits: $('stat-credits'),
+  statSpend: $('stat-spend'), statCredits: $('stat-credits'), statBuild: $('stat-build'),
   settings: $('settings'), openSettings: $('open-settings'),
   apiKey: $('api-key'), baseUrl: $('base-url'), saveSettings: $('save-settings'),
   viewer: $('viewer'), viewerImg: $('viewer-img'), viewerPrompt: $('viewer-prompt'),
@@ -58,6 +58,7 @@ const state = {
   history: [],
   objectUrls: new Set(),
   inflight: null,
+  confirmRepeat: false,
 };
 
 /* ── Утилиты ───────────────────────────────────────────── */
@@ -264,6 +265,13 @@ function removeRef(key) {
   renderRefs();
 }
 
+/** Подтверждение повтора действует только для той пары «промпт + референсы». */
+function resetRepeat() {
+  if (!state.confirmRepeat) return;
+  state.confirmRepeat = false;
+  el.generate.textContent = 'Сгенерировать';
+}
+
 function renderRefs() {
   el.refs.replaceChildren(...state.refs.map((ref) => {
     const div = document.createElement('div');
@@ -285,6 +293,7 @@ function renderRefs() {
     div.append(img, pencil, btn);
     return div;
   }));
+  resetRepeat();
   const cap = maxRefs();
   el.refCounter.textContent = cap ? `${state.refs.length} / ${cap}` : '';
   el.dropzone.hidden = cap === 0;
@@ -320,6 +329,18 @@ async function generate() {
   }
   const prompt = el.prompt.value.trim();
   if (!prompt) { say('Нужен промпт.', 'error'); el.prompt.focus(); return; }
+
+  // Тем же промптом по тому же изображению модель вернёт его же. Ловим до
+  // отправки: после неё деньги уже списаны.
+  const repeat = state.refs.some((r) => r.fromPrompt && r.fromPrompt.trim() === prompt);
+  if (repeat && !state.confirmRepeat) {
+    state.confirmRepeat = true;
+    el.generate.textContent = 'Всё равно отправить';
+    say('Этим же промптом получен приложенный референс — модель вернёт его копию. Опиши, ЧТО ИЗМЕНИТЬ, или нажми ещё раз.', 'error');
+    return;
+  }
+  state.confirmRepeat = false;
+  el.generate.textContent = 'Сгенерировать';
 
   const model = currentModel();
   const resolution = el.resolution.disabled ? undefined : el.resolution.value;
@@ -365,6 +386,10 @@ async function generate() {
     // картинку вместо того, чтобы говорить, что с ней сделать. Выдавать такую
     // копию за результат нельзя — за неё уже заплачено.
     const echo = record.refs.length ? await difference(record.out, record.refs[0]) : null;
+    if (echo != null && echo < ECHO_LIMIT) {
+      record.echo = true;
+      await db.put(record);
+    }
     say(echo != null && echo < ECHO_LIMIT
       ? `Модель вернула референс почти без изменений (${echo.toFixed(1)} из 255) · ${money(record.cost)}. Промпт должен говорить, ЧТО СДЕЛАТЬ с референсом, а не описывать его.`
       : `Готово за ${record.seconds} с · ${money(record.cost)}`,
@@ -560,7 +585,9 @@ function renderHistory() {
     p.textContent = rec.prompt;
     const small = document.createElement('small');
     const when = new Date(rec.ts).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-    const tail = rec.kind === 'brush' ? ' · кисть' : (rec.refs.length ? ` · ${rec.refs.length} реф.` : '');
+    const tail = rec.echo
+      ? ' · копия референса'
+      : (rec.kind === 'brush' ? ' · кисть' : (rec.refs.length ? ` · ${rec.refs.length} реф.` : ''));
     small.textContent = `${when} · ${money(rec.cost)}${tail}`;
     cap.append(p, small);
 
@@ -618,7 +645,9 @@ async function useAsReference() {
   // Через toReference, а не напрямую: у векторных моделей результат — SVG,
   // его нужно растеризовать, иначе он уйдёт в запрос неподъёмным для модели.
   const { blob } = await toReference(new File([viewing.out], 'result', { type: viewing.outType }));
-  state.refs.push({ key: ++refKey, blob, url: URL.createObjectURL(blob), name: 'result' });
+  // Запоминаем, каким промптом получен этот референс: повторная отправка того же
+  // текста — верный способ получить назад его же копию.
+  state.refs.push({ key: ++refKey, blob, url: URL.createObjectURL(blob), name: 'result', fromPrompt: viewing.prompt });
 
   renderRefs();
   el.viewer.close();
@@ -687,6 +716,7 @@ function bind() {
   el.prompt.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') generate();
   });
+  el.prompt.addEventListener('input', resetRepeat);
 
   el.dropzone.addEventListener('click', () => el.fileInput.click());
   el.dropzone.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.fileInput.click(); } });
@@ -774,6 +804,7 @@ async function checkBuild() {
 
 async function init() {
   $('build-id').textContent = BUILD;
+  el.statBuild.textContent = `сборка ${BUILD}`;
   checkBuild();
   bind();
   renderRefs();
