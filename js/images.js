@@ -109,6 +109,30 @@ export async function toReference(source) {
   return { blob: blob || file, width: w, height: h, name };
 }
 
+/**
+ * Средняя разница канала между двумя картинками, 0…255. Нужна, чтобы поймать
+ * случай, когда модель вернула референс вместо новой картинки: шум пережатия
+ * даёт единицы, настоящая генерация — десятки.
+ */
+export async function difference(a, b, edge = 256) {
+  const draw = async (blob) => {
+    const bmp = await createImageBitmap(await rasterize(blob, edge));
+    const c = document.createElement('canvas');
+    c.width = edge;
+    c.height = edge;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(bmp, 0, 0, edge, edge);   // обе к общей рамке: пропорции могут не совпадать
+    bmp.close?.();
+    return ctx.getImageData(0, 0, edge, edge).data;
+  };
+  const [A, B] = await Promise.all([draw(a), draw(b)]);
+  let sum = 0;
+  for (let i = 0; i < A.length; i += 4) {
+    sum += Math.abs(A[i] - B[i]) + Math.abs(A[i + 1] - B[i + 1]) + Math.abs(A[i + 2] - B[i + 2]);
+  }
+  return sum / (A.length / 4 * 3);
+}
+
 export function download(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

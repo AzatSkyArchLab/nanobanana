@@ -50,6 +50,12 @@
       </div>
       <input type="file" id="file-input" accept="image/*" multiple hidden>
       <div class="refs" id="refs"></div>
+      <p class="hint" id="ref-hint" hidden>
+        Промпт должен говорить, ЧТО СДЕЛАТЬ с референсом, а не описывать его:
+        «помести логотип с референса на белую кружку», а не «оранжевый круг
+        с треугольником». Описание приложенного модель понимает как просьбу
+        вернуть его же.
+      </p>
     </div>
 
     <div class="actions">
@@ -174,6 +180,6 @@
   </div>
 </dialog>
 
-<script type="module" src="js/app.js?v=202609161247"></script>
+<script type="module" src="js/app.js?v=202609161315"></script>
 </body>
 </html>

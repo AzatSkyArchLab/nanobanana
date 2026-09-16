@@ -10,7 +10,7 @@ const [api, db, brush, images] = await Promise.all([
   import('./brush.js' + V),
   import('./images.js' + V),
 ]);
-const { toReference, blobToDataUrl, base64ToBlob, download, extFor, isImage } = images;
+const { toReference, blobToDataUrl, base64ToBlob, download, extFor, isImage, difference } = images;
 
 const $ = (id) => document.getElementById(id);
 
@@ -18,7 +18,7 @@ const el = {
   model: $('model'), modelHint: $('model-hint'),
   aspect: $('aspect'), resolution: $('resolution'),
   prompt: $('prompt'), dropzone: $('dropzone'), fileInput: $('file-input'),
-  refs: $('refs'), refCounter: $('ref-counter'),
+  refs: $('refs'), refCounter: $('ref-counter'), refHint: $('ref-hint'),
   generate: $('generate'), cancel: $('cancel'),
   estimate: $('estimate'), status: $('status'),
   grid: $('grid'), empty: $('empty'), clearHistory: $('clear-history'),
@@ -47,6 +47,9 @@ const LS_LAST_MODEL = 'nb.lastModel';
 // Средняя разница канала внутри маски ниже этого порога означает, что модель
 // вернула исходник: шум пережатия даёт 1–2 из 255.
 const QUIET_CHANGE = 4;
+// То же для обычной генерации: насколько результат отличается от первого
+// референса. Настоящая генерация даёт десятки, копия — единицы.
+const ECHO_LIMIT = 6;
 
 const state = {
   models: [],
@@ -285,6 +288,7 @@ function renderRefs() {
   const cap = maxRefs();
   el.refCounter.textContent = cap ? `${state.refs.length} / ${cap}` : '';
   el.dropzone.hidden = cap === 0;
+  el.refHint.hidden = state.refs.length === 0;
 }
 
 /* ── Генерация ─────────────────────────────────────────── */
@@ -356,7 +360,15 @@ async function generate() {
     state.history.unshift(record);
     renderHistory();
     updateEstimate();
-    say(`Готово за ${record.seconds} с · ${money(record.cost)}`);
+
+    // Модель отвечает копией референса, когда промпт ОПИСЫВАЕТ приложенную
+    // картинку вместо того, чтобы говорить, что с ней сделать. Выдавать такую
+    // копию за результат нельзя — за неё уже заплачено.
+    const echo = record.refs.length ? await difference(record.out, record.refs[0]) : null;
+    say(echo != null && echo < ECHO_LIMIT
+      ? `Модель вернула референс почти без изменений (${echo.toFixed(1)} из 255) · ${money(record.cost)}. Промпт должен говорить, ЧТО СДЕЛАТЬ с референсом, а не описывать его.`
+      : `Готово за ${record.seconds} с · ${money(record.cost)}`,
+      echo != null && echo < ECHO_LIMIT ? 'error' : '');
     // Агрегация расхода на стороне OpenRouter отстаёт примерно на полминуты,
     // поэтому баланс перечитывается ещё раз. Счётчик «Потрачено» точен сразу —
     // он складывается из usage.cost каждого ответа.
