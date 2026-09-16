@@ -280,11 +280,59 @@ export async function buildOriginal() {
  * Перед этим результат совмещается с оригиналом, иначе на границе маски
  * возникает задвоение: модель перерисовывает кадр и композиция уезжает.
  */
-export async function compose(resultBlob) {
+/**
+ * Насколько результат отличается от оригинала ВНУТРИ маски: средняя разница
+ * канала, 0…255. Нужна, чтобы отличить настоящую правку от случая, когда
+ * модель вернула исходник — со склейкой такой ответ даёт кадр, побитово
+ * равный входу, и без замера выглядел бы как успешная правка.
+ */
+function changeInside(result, mask, fit) {
+  const k = Math.min(1, 256 / Math.max(state.width, state.height));
+  const w = Math.max(8, Math.round(state.width * k));
+  const h = Math.max(8, Math.round(state.height * k));
+  const pick = (draw) => {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    draw(c.getContext('2d'));
+    return c.getContext('2d').getImageData(0, 0, w, h).data;
+  };
+
+  const A = pick((ctx) => ctx.drawImage(state.bitmap, 0, 0, w, h));
+  const B = pick((ctx) => ctx.drawImage(
+    result,
+    fit.tx * k, fit.ty * k,
+    state.width * fit.scale * k, state.height * fit.scale * k,
+  ));
+  const M = pick((ctx) => ctx.drawImage(mask, 0, 0, w, h));
+
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i < M.length; i += 4) {
+    if (M[i + 3] < 128) continue;
+    sum += Math.abs(A[i] - B[i]) + Math.abs(A[i + 1] - B[i + 1]) + Math.abs(A[i + 2] - B[i + 2]);
+    n += 3;
+  }
+  return n ? sum / n : 0;
+}
+
+async function alignTo(resultBlob) {
   const result = await createImageBitmap(resultBlob);
   const mask = union();
-
   const fit = estimateAlignment(state.bitmap, result, mask, state.width, state.height);
+  fit.changed = changeInside(result, mask, fit);
+  return { result, mask, fit };
+}
+
+/** Замер без склейки — для случая, когда «оставить остальное нетронутым» снято. */
+export async function measure(resultBlob) {
+  const { result, fit } = await alignTo(resultBlob);
+  result.close?.();
+  return fit;
+}
+
+export async function compose(resultBlob) {
+  const { result, mask, fit } = await alignTo(resultBlob);
 
   const base = blank();
   const ctx = base.getContext('2d');
@@ -320,20 +368,29 @@ export async function compose(resultBlob) {
  * Цвета названы по-английски и по-русски — промпт можно писать на любом.
  */
 export function buildPrompt(userText) {
-  const text = userText.trim().replace(/[.!;]*$/, '.');   // иначе слипается со следующим предложением
+  const text = userText.trim().replace(/[.!;\s]*$/, '');
   const colours = usedColors();
   const list = colours.map((c) => `${c.en} (${c.ru})`).join(', ');
-  const areas = colours.length > 1
-    ? `Image 2 marks several regions with translucent overlays in these colours: ${list}. The instructions below refer to those colours; apply each one to its own region.`
+  const many = colours.length > 1;
+
+  const scene = many
+    ? `Image 2 is the same picture with translucent overlays marking several regions, in these colours: ${list}.`
     : `Image 2 is the same picture with a translucent ${list} overlay marking one region.`;
+
+  // Приказ обязан стоять до запретов и быть единственным глаголом в
+  // повелительном наклонении. Без него модель получает только список того,
+  // что менять нельзя, и возвращает исходник нетронутым.
+  const order = many
+    ? `Edit image 1: change ONLY the regions covered by those overlays, applying each instruction to the region whose colour it names — ${text}.`
+    : `Edit image 1: change ONLY the region covered by the overlay — ${text}.`;
 
   return [
     'You are given two images of the same picture.',
     'Image 1 is the original.',
-    areas,
-    `Instructions: ${text}`,
-    'Everything outside the marked regions must stay exactly as in image 1 — same composition, framing, colors, lighting, textures and details.',
-    'The overlays are instruction markers: they must not appear anywhere in the output.',
-    'Return the full picture at the same framing and aspect ratio as image 1.',
+    scene,
+    order,
+    `Keep everything outside the marked ${many ? 'regions' : 'region'} exactly as in image 1: same composition, colors, lighting, textures and details.`,
+    'The overlays are instruction markers, not content: they must not appear anywhere in the output.',
+    'Output the edited picture at the same framing and aspect ratio as image 1.',
   ].join(' ');
 }

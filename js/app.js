@@ -44,6 +44,9 @@ const el = {
 const TOKENS_PER_IMAGE = { '512': 560, '1K': 1120, '2K': 1120, '4K': 2000 };
 const PREFERRED_MODEL = 'google/gemini-3.1-flash-image';
 const LS_LAST_MODEL = 'nb.lastModel';
+// Средняя разница канала внутри маски ниже этого порога означает, что модель
+// вернула исходник: шум пережатия даёт 1–2 из 255.
+const QUIET_CHANGE = 4;
 
 const state = {
   models: [],
@@ -470,6 +473,8 @@ async function runBrush() {
     if (el.brushKeep.checked) {
       ({ blob: out, fit } = await brush.compose(out));   // снаружи маски остаётся оригинал
       outType = 'image/png';
+    } else {
+      fit = await brush.measure(out);
     }
 
     const record = {
@@ -493,14 +498,24 @@ async function runBrush() {
     state.history.unshift(record);
     renderHistory();
     updateEstimate();
-    el.brushStatus.textContent = '';
-    el.brushStatus.className = 'status';
-    el.brush.close();
     const drift = fit && (Math.abs(fit.tx) > 1 || Math.abs(fit.ty) > 1 || fit.scale !== 1)
       ? ` · кадр совмещён (сдвиг ${Math.round(fit.tx)}/${Math.round(fit.ty)} px, масштаб ${fit.scale.toFixed(2)})`
       : '';
-    say(`Правка готова за ${record.seconds} с · ${money(record.cost)}${drift}`);
-    openViewer(record.id);
+
+    // Модель могла вернуть исходник нетронутым. Со склейкой это даёт кадр,
+    // побитово равный входу, и без проверки выглядело бы как успешная правка —
+    // именно так «ничего не работает» и выглядит снаружи.
+    if (fit && fit.changed < QUIET_CHANGE) {
+      el.brushStatus.textContent = `Модель почти не тронула закрашенное (${fit.changed.toFixed(1)} из 255). Переформулируй или увеличь область — маска сохранена, результат уже в истории.`;
+      el.brushStatus.className = 'status error';
+      say(`Правка не применилась · ${money(record.cost)}`);
+    } else {
+      el.brushStatus.textContent = '';
+      el.brushStatus.className = 'status';
+      el.brush.close();
+      say(`Правка готова за ${record.seconds} с · ${money(record.cost)}${drift}`);
+      openViewer(record.id);
+    }
     refreshCredits();
     setTimeout(refreshCredits, 30000);
   } catch (e) {
