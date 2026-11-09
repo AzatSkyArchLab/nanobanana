@@ -4,10 +4,9 @@
 const V = new URL(import.meta.url).search;
 export const BUILD = new URLSearchParams(V).get('v') || 'dev';
 
-const [api, db, brush, images] = await Promise.all([
+const [api, db, images] = await Promise.all([
   import('./api.js' + V),
   import('./db.js' + V),
-  import('./brush.js' + V),
   import('./images.js' + V),
 ]);
 const { toReference, blobToDataUrl, base64ToBlob, download, extFor, isImage, difference } = images;
@@ -21,43 +20,39 @@ const el = {
   refs: $('refs'), refCounter: $('ref-counter'), refHint: $('ref-hint'),
   generate: $('generate'), cancel: $('cancel'),
   estimate: $('estimate'), status: $('status'),
+  openPdf: $('open-pdf'), pdfInput: $('pdf-input'), sheetList: $('sheet-list'),
   grid: $('grid'), empty: $('empty'), clearHistory: $('clear-history'),
   statSpend: $('stat-spend'), statCredits: $('stat-credits'), statBuild: $('stat-build'),
   settings: $('settings'), openSettings: $('open-settings'),
-  apiKey: $('api-key'), baseUrl: $('base-url'), saveSettings: $('save-settings'),
+  apiKey: $('api-key'), baseUrl: $('base-url'), cancelSettings: $('cancel-settings'),
   viewer: $('viewer'), viewerImg: $('viewer-img'), viewerPrompt: $('viewer-prompt'),
   viewerMeta: $('viewer-meta'), viewerRefs: $('viewer-refs'), viewerClose: $('viewer-close'),
   viewerDownload: $('viewer-download'), viewerToRef: $('viewer-toref'),
   viewerRepeat: $('viewer-repeat'), viewerDelete: $('viewer-delete'),
   viewerBrush: $('viewer-brush'),
-  brush: $('brush'), brushImg: $('brush-img'), brushCanvas: $('brush-canvas'),
-  brushSize: $('brush-size'), brushSizeVal: $('brush-size-val'),
-  brushMode: $('brush-mode'), brushUndo: $('brush-undo'), brushClear: $('brush-clear'),
-  brushColors: $('brush-colors'), brushLegend: $('brush-legend'),
-  brushPrompt: $('brush-prompt'), brushKeep: $('brush-keep'),
-  brushRun: $('brush-run'), brushCancel: $('brush-cancel'), brushStatus: $('brush-status'),
+  editor: $('editor'),
 };
 
 // Приблизительное число выходных токенов на картинку у моделей с потокенной
-// тарификацией — только для оценки «до». Фактическая цена приходит в usage.cost
+// тарификацией: только для оценки «до». Фактическая цена приходит в usage.cost
 // и, как только она известна, вытесняет оценку.
 const TOKENS_PER_IMAGE = { '512': 560, '1K': 1120, '2K': 1120, '4K': 2000 };
-const PREFERRED_MODEL = 'google/gemini-3.1-flash-image';
+// Модель по умолчанию для нового браузера: первая доступная из списка.
+const PREFERRED_MODELS = ['google/gemini-nano-banana-2.1', 'google/gemini-3.1-flash-image'];
 const LS_LAST_MODEL = 'nb.lastModel';
-// Средняя разница канала внутри маски ниже этого порога означает, что модель
-// вернула исходник: шум пережатия даёт 1–2 из 255.
-const QUIET_CHANGE = 4;
-// То же для обычной генерации: насколько результат отличается от первого
-// референса. Настоящая генерация даёт десятки, копия — единицы.
+// То же для обычной генерации: насколько результат отличается от
+// референсов. Настоящая генерация даёт десятки, копия единицы.
 const ECHO_LIMIT = 6;
 
 const state = {
   models: [],
-  pricing: new Map(),   // id -> { unit, cost, variants }
-  refs: [],             // { key, blob, url, name }
+  pricing: new Map(),   // id -> { unit, byVariant }
+  refs: [],             // { key, blob, url, name, fromPrompt? }
   history: [],
-  objectUrls: new Set(),
-  inflight: null,
+  gridUrls: new Set(),
+  viewerUrls: new Set(),
+  inflight: null,       // AbortController обычной генерации; у редактора свой
+  drawing: false,       // обычная генерация ждёт ответа: в истории карточка «рисуется…»
   confirmRepeat: false,
 };
 
@@ -69,15 +64,27 @@ const money = (v) => {
   return `$${v < 0.01 ? v.toFixed(4) : v.toFixed(2)}`;
 };
 
-function trackUrl(blob) {
+/** Русское число: plural(3, ['лист', 'листа', 'листов']) -> 'листа'. */
+function plural(n, [one, few, many]) {
+  const a = Math.abs(n) % 100;
+  const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b === 1) return one;
+  if (b >= 2 && b <= 4) return few;
+  return many;
+}
+
+const isPdf = (file) => !!file && (file.type === 'application/pdf' || /\.pdf$/i.test(file.name || ''));
+
+function urlIn(set, blob) {
   const url = URL.createObjectURL(blob);
-  state.objectUrls.add(url);
+  set.add(url);
   return url;
 }
 
-function releaseUrls() {
-  for (const url of state.objectUrls) URL.revokeObjectURL(url);
-  state.objectUrls.clear();
+function release(set) {
+  for (const url of set) URL.revokeObjectURL(url);
+  set.clear();
 }
 
 function say(text, kind = '') {
@@ -96,6 +103,10 @@ function maxRefs() {
 
 /* ── Модели и их параметры ─────────────────────────────── */
 
+// Nano Banana узнаётся по имени: у новых моделей в id уже нет слова image
+// (google/gemini-nano-banana-2.1), и по одному id она уезжала в «Другие».
+const isBanana = (m) => /nano banana/i.test(m.name || '') || (m.id.startsWith('google/gemini') && /image/.test(m.id));
+
 async function loadModels() {
   const { data } = await api.listImageModels();
 
@@ -103,7 +114,6 @@ async function loadModels() {
   const stable = new Set(data.map((m) => m.id).filter((id) => !id.endsWith('-preview')));
   const visible = data.filter((m) => !(m.id.endsWith('-preview') && stable.has(m.id.replace('-preview', ''))));
 
-  const isBanana = (m) => m.id.startsWith('google/gemini') && /image/.test(m.id);
   const bananas = visible.filter(isBanana).sort((a, b) => b.created - a.created);
   const others = visible.filter((m) => !isBanana(m)).sort((a, b) => a.name.localeCompare(b.name));
 
@@ -127,7 +137,7 @@ async function loadModels() {
   );
 
   const saved = localStorage.getItem(LS_LAST_MODEL);
-  const pick = [saved, PREFERRED_MODEL, state.models[0]?.id].find((id) => id && state.models.some((m) => m.id === id));
+  const pick = [saved, ...PREFERRED_MODELS, state.models[0]?.id].find((id) => id && state.models.some((m) => m.id === id));
   el.model.value = pick;
   await applyModel();
 }
@@ -163,14 +173,14 @@ async function applyModel() {
   const cap = maxRefs();
   el.modelHint.textContent = cap
     ? `До ${cap} референсов на запрос.`
-    : 'Модель не принимает референсы — только текст.';
-  if (state.refs.length > cap) {
-    state.refs.splice(cap).forEach((r) => URL.revokeObjectURL(r.url));
-  }
+    : 'Модель не принимает референсы: только текст.';
+  // Лишние референсы не удаляются: смена модели ради цены не должна
+  // молча выбрасывать собранные картинки. Они гаснут, генерация их не примет.
   renderRefs();
 
   await loadPricing(model.id);
   updateEstimate();
+  editorModule.loaded?.syncModels();
 }
 
 async function loadPricing(id) {
@@ -185,12 +195,12 @@ async function loadPricing(id) {
       byVariant: Object.fromEntries(out.map((p) => [p.variant || 'default', p.cost_usd])),
     });
   } catch {
-    // Прайс — не критично: точная цена всё равно придёт в ответе.
+    // Прайс не критичен: точная цена всё равно придёт в ответе.
   }
 }
 
 function estimateCost(modelId, resolution) {
-  // Факт всегда точнее оценки: если такие генерации уже были — берём среднее.
+  // Факт всегда точнее оценки: если такие генерации уже были, берём среднее.
   const seen = state.history.filter((r) => r.model === modelId && r.resolution === resolution && r.cost > 0);
   if (seen.length) {
     return { value: seen.reduce((s, r) => s + r.cost, 0) / seen.length, actual: true };
@@ -209,10 +219,11 @@ function estimateCost(modelId, resolution) {
 }
 
 const shortName = (name) => name.replace(/^Google:\s*/, '');
+const currentResolution = () => (el.resolution.disabled ? undefined : el.resolution.value);
 
 /**
- * Сообщение на время ожидания. Скорость у моделей разная — от секунд
- * у Riverflow Fast до минуты у Pro, — поэтому время берётся из истории
+ * Сообщение на время ожидания. Скорость у моделей разная, от секунд
+ * у Riverflow Fast до минуты у Pro, поэтому время берётся из истории
  * этой же модели, как и оценка стоимости.
  */
 function busyText(model) {
@@ -220,13 +231,13 @@ function busyText(model) {
   const name = shortName(model.name);
   if (!seen.length) return `Запрос ушёл в «${name}». Может занять до минуты.`;
   const avg = Math.round(seen.reduce((s, r) => s + r.seconds, 0) / seen.length);
-  return `Запрос ушёл в «${name}» — обычно ${avg} с.`;
+  return `Запрос ушёл в «${name}», обычно ${avg} с.`;
 }
 
 function updateEstimate() {
-  const est = estimateCost(el.model.value, el.resolution.disabled ? undefined : el.resolution.value);
+  const est = estimateCost(el.model.value, currentResolution());
   el.estimate.textContent = est
-    ? (est.actual ? `Обычно ${money(est.value)} за картинку — по прошлым запускам.` : `Примерно ${money(est.value)} за картинку.`)
+    ? (est.actual ? `Обычно ${money(est.value)} за картинку по прошлым запускам.` : `Примерно ${money(est.value)} за картинку.`)
     : '';
 }
 
@@ -235,14 +246,21 @@ function updateEstimate() {
 let refKey = 0;
 
 async function addFiles(files) {
+  const all = Array.from(files || []);
+  const pdf = all.find(isPdf);
+  if (pdf) {
+    openPdfFile(pdf);
+    return;
+  }
+
   const cap = maxRefs();
   if (!cap) { say('Выбранная модель не принимает референсы.', 'error'); return; }
 
-  const incoming = Array.from(files).filter(isImage);
+  const incoming = all.filter(isImage);
   if (!incoming.length) return;
 
   const room = cap - state.refs.length;
-  if (room <= 0) { say(`Уже ${cap} референсов — больше модель не примет.`, 'error'); return; }
+  if (room <= 0) { say(`Уже ${state.refs.length} референсов при лимите ${cap}: больше модель не примет.`, 'error'); return; }
 
   for (const file of incoming.slice(0, room)) {
     try {
@@ -252,7 +270,7 @@ async function addFiles(files) {
       say(`Не удалось прочитать «${file.name}».`, 'error');
     }
   }
-  if (incoming.length > room) say(`Добавлено ${room} из ${incoming.length}: лимит модели — ${cap}.`);
+  if (incoming.length > room) say(`Добавлено ${room} из ${incoming.length}: лимит модели ${cap}.`);
   renderRefs();
   updateEstimate();
 }
@@ -273,9 +291,14 @@ function resetRepeat() {
 }
 
 function renderRefs() {
-  el.refs.replaceChildren(...state.refs.map((ref) => {
+  const cap = maxRefs();
+  el.refs.replaceChildren(...state.refs.map((ref, i) => {
     const div = document.createElement('div');
     div.className = 'ref';
+    if (i >= cap) {
+      div.classList.add('over');
+      div.title = cap ? `Модель примет только ${cap}: этот не уйдёт` : 'Модель не принимает референсы';
+    }
     const img = document.createElement('img');
     img.src = ref.url;
     img.alt = ref.name;
@@ -288,14 +311,14 @@ function renderRefs() {
     pencil.className = 'edit';
     pencil.textContent = '✎';
     pencil.title = 'Исправить кистью';
-    pencil.addEventListener('click', () => openBrush(ref.blob));
+    pencil.addEventListener('click', () => openEditor(ref.blob, ref.name));
 
     div.append(img, pencil, btn);
     return div;
   }));
   resetRepeat();
-  const cap = maxRefs();
-  el.refCounter.textContent = cap ? `${state.refs.length} / ${cap}` : '';
+  el.refCounter.textContent = cap || state.refs.length ? `${state.refs.length} / ${cap}` : '';
+  el.refCounter.classList.toggle('error', state.refs.length > cap);
   el.dropzone.hidden = cap === 0;
   el.refHint.hidden = state.refs.length === 0;
 }
@@ -321,7 +344,27 @@ function showPending(on) {
   }
 }
 
+/**
+ * Запись в историю. Сначала показ, потом база: если IndexedDB откажет
+ * (кончилось место), оплаченная картинка всё равно видна и скачивается.
+ */
+async function saveRecord(record) {
+  state.history.unshift(record);
+  renderHistory();
+  updateEstimate();
+  try {
+    await db.add(record);
+    return true;
+  } catch (e) {
+    record.unsaved = true;
+    say(`Картинка получена, но в историю браузера не записалась (${e.message || e.name}). Скачай её, пока страница открыта.`, 'error');
+    return false;
+  }
+}
+
 async function generate() {
+  // ⌘Enter работает и при заблокированной кнопке: второй запрос сюда не пускаем.
+  if (state.inflight) return;
   if (!api.getKey()) {
     say('Сначала добавь ключ OpenRouter.', 'error');
     openSettings();
@@ -330,37 +373,54 @@ async function generate() {
   const prompt = el.prompt.value.trim();
   if (!prompt) { say('Нужен промпт.', 'error'); el.prompt.focus(); return; }
 
+  const model = currentModel();
+  if (!model) {
+    say('Список моделей не загрузился. Пробую ещё раз, повтори запуск через пару секунд.', 'error');
+    loadModels().then(() => say('Список моделей загружен.')).catch(() => {});
+    return;
+  }
+  const cap = maxRefs();
+  if (state.refs.length > cap) {
+    say(cap
+      ? `«${shortName(model.name)}» принимает ${cap} реф., приложено ${state.refs.length}. Убери лишние или смени модель.`
+      : `«${shortName(model.name)}» не принимает референсы: убери их или смени модель.`, 'error');
+    return;
+  }
+
   // Тем же промптом по тому же изображению модель вернёт его же. Ловим до
   // отправки: после неё деньги уже списаны.
   const repeat = state.refs.some((r) => r.fromPrompt && r.fromPrompt.trim() === prompt);
   if (repeat && !state.confirmRepeat) {
     state.confirmRepeat = true;
     el.generate.textContent = 'Всё равно отправить';
-    say('Этим же промптом получен приложенный референс — модель вернёт его копию. Опиши, ЧТО ИЗМЕНИТЬ, или нажми ещё раз.', 'error');
+    say('Этим же промптом получен приложенный референс, модель вернёт его копию. Опиши, ЧТО ИЗМЕНИТЬ, или нажми ещё раз.', 'error');
     return;
   }
   state.confirmRepeat = false;
-  el.generate.textContent = 'Сгенерировать';
 
-  const model = currentModel();
-  const resolution = el.resolution.disabled ? undefined : el.resolution.value;
+  const resolution = currentResolution();
   const aspectRatio = el.aspect.disabled ? undefined : el.aspect.value;
+  // Референсы запоминаются на момент отправки: пока модель думает, список
+  // можно менять, а в истории должно остаться то, что ушло на самом деле.
+  const sent = state.refs.slice();
 
-  state.inflight = new AbortController();
+  const ctrl = new AbortController();
+  state.inflight = ctrl;
+  state.drawing = true;
   setBusy(true);
   showPending(true);
   say(busyText(model), 'busy');
 
   try {
-    const references = await Promise.all(state.refs.map((r) => blobToDataUrl(r.blob)));
+    const references = await Promise.all(sent.map((r) => blobToDataUrl(r.blob)));
     const started = Date.now();
     const res = await api.generate({
       model: model.id, prompt, references, aspectRatio, resolution,
-      signal: state.inflight.signal,
+      signal: ctrl.signal,
     });
 
     const image = res?.data?.[0];
-    if (!image?.b64_json) throw new Error('Ответ без изображения — модель отказалась генерировать.');
+    if (!image?.b64_json) throw new Error('Ответ без изображения: модель отказалась генерировать.');
 
     const record = {
       id: `${started}-${Math.random().toString(36).slice(2, 8)}`,
@@ -374,28 +434,35 @@ async function generate() {
       seconds: Math.round((Date.now() - started) / 1000),
       outType: image.media_type || 'image/png',
       out: base64ToBlob(image.b64_json, image.media_type || 'image/png'),
-      refs: state.refs.map((r) => r.blob),
+      refs: sent.map((r) => r.blob),
     };
 
-    await db.add(record);
-    state.history.unshift(record);
-    renderHistory();
-    updateEstimate();
+    state.drawing = false;
+    showPending(false);
+    const saved = await saveRecord(record);
 
     // Модель отвечает копией референса, когда промпт ОПИСЫВАЕТ приложенную
-    // картинку вместо того, чтобы говорить, что с ней сделать. Выдавать такую
-    // копию за результат нельзя — за неё уже заплачено.
-    const echo = record.refs.length ? await difference(record.out, record.refs[0]) : null;
-    if (echo != null && echo < ECHO_LIMIT) {
-      record.echo = true;
-      await db.put(record);
+    // картинку вместо того, чтобы говорить, что с ней сделать. Сравниваем со
+    // всеми референсами: копией может оказаться любой из них.
+    let echo = null;
+    if (record.refs.length) {
+      const diffs = await Promise.all(record.refs.map((b) => difference(record.out, b).catch(() => Infinity)));
+      echo = Math.min(...diffs);
     }
-    say(echo != null && echo < ECHO_LIMIT
-      ? `Модель вернула референс почти без изменений (${echo.toFixed(1)} из 255) · ${money(record.cost)}. Промпт должен говорить, ЧТО СДЕЛАТЬ с референсом, а не описывать его.`
-      : `Готово за ${record.seconds} с · ${money(record.cost)}`,
-      echo != null && echo < ECHO_LIMIT ? 'error' : '');
+    const copied = echo != null && echo < ECHO_LIMIT;
+    if (copied) {
+      record.echo = true;
+      if (saved) await db.put(record).catch(() => {});
+      renderHistory();
+    }
+    if (saved) {
+      say(copied
+        ? `Модель вернула референс почти без изменений (${echo.toFixed(1)} из 255) · ${money(record.cost)}. Промпт должен говорить, ЧТО СДЕЛАТЬ с референсом: описание приложенного модель понимает как просьбу вернуть его же.`
+        : `Готово за ${record.seconds} с · ${money(record.cost)}`,
+        copied ? 'error' : '');
+    }
     // Агрегация расхода на стороне OpenRouter отстаёт примерно на полминуты,
-    // поэтому баланс перечитывается ещё раз. Счётчик «Потрачено» точен сразу —
+    // поэтому баланс перечитывается ещё раз. Счётчик «Потрачено» точен сразу:
     // он складывается из usage.cost каждого ответа.
     refreshCredits();
     setTimeout(refreshCredits, 30000);
@@ -404,170 +471,116 @@ async function generate() {
     else say(e.message || 'Не получилось.', 'error');
   } finally {
     state.inflight = null;
+    state.drawing = false;
     setBusy(false);
     showPending(false);
   }
 }
 
-/* ── Кисть: локальная правка ───────────────────────────── */
+/* ── Редактор: кисть, области с референсами, листы PDF ─── */
 
-/** Ближайшая к картинке пропорция из тех, что принимает модель. */
-function closestAspect(width, height) {
-  if (el.aspect.disabled) return undefined;
-  const target = Math.log(width / height);
-  let best = null;
-  for (const o of el.aspect.options) {
-    if (o.value === 'auto') continue;
-    const [w, h] = o.value.split(':').map(Number);
-    const d = Math.abs(Math.log(w / h) - target);
-    if (!best || d < best.d) best = { value: o.value, d };
+// Модуль редактора грузится при первом открытии: если он не загрузится,
+// обычная генерация продолжит работать.
+let editorPromise = null;
+function editorModule() {
+  if (!editorPromise) {
+    editorPromise = import('./editor.js' + V).then((ed) => {
+      ed.init({
+        api,
+        modelSelect: el.model,
+        resolutionSelect: el.resolution,
+        currentModel,
+        maxRefs,
+        aspectValues: () => currentModel()?.supported_parameters?.aspect_ratio?.values || [],
+        resolution: currentResolution,
+        setModel: async (id) => { el.model.value = id; await applyModel(); },
+        setResolution: (v) => { el.resolution.value = v; updateEstimate(); },
+        estimate: () => estimateCost(el.model.value, currentResolution()),
+        money,
+        shortName,
+        busyText,
+        plural,
+        saveRecord,
+        refreshCredits,
+        openViewer,
+        onSheetsChanged: renderSheets,
+      });
+      editorModule.loaded = ed;
+      return ed;
+    }).catch((e) => {
+      editorPromise = null;
+      throw e;
+    });
   }
-  return best?.value;
+  return editorPromise;
+}
+editorModule.loaded = null;
+
+async function withEditor(fn) {
+  try {
+    await fn(await editorModule());
+  } catch (e) {
+    say(`Редактор не открылся: ${e.message || e}`, 'error');
+  }
 }
 
-function buildSwatches() {
-  el.brushColors.replaceChildren(...brush.PALETTE.map((colour) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.style.background = colour.hex;
-    b.title = colour.ru;
-    b.dataset.key = colour.key;
-    b.addEventListener('click', () => selectColour(colour.key));
-    return b;
-  }));
+function openEditor(blob, name) {
+  if (el.viewer.open) el.viewer.close();
+  return withEditor((ed) => ed.openImage(blob, name));
 }
 
-function selectColour(key) {
-  brush.setColor(key);
-  brush.setErase(false);
-  el.brushMode.textContent = 'Ластик';
-  el.brushMode.classList.remove('active');
-  for (const b of el.brushColors.children) b.classList.toggle('active', b.dataset.key === key);
+function openPdfFile(file) {
+  return withEditor((ed) => ed.openPdfFile(file));
 }
 
-/** Подсказка, какими словами ссылаться на закрашенное. */
-function updateLegend() {
-  const used = brush.usedColors();
-  el.brushLegend.textContent = used.length
-    ? `Закрашено: ${used.map((c) => c.ru).join(', ')}. Ссылайся на цвета в тексте.`
-    : '';
+function openSheet(id) {
+  return withEditor((ed) => ed.openSheet(id));
 }
 
-async function openBrush(blob) {
-  // Кисть шлёт две картинки: оригинал и его размеченную копию.
-  if (maxRefs() < 2) {
-    const model = currentModel();
-    const fits = state.models.filter((m) => (m.supported_parameters?.input_references?.max ?? 0) >= 2);
-    const hint = fits.slice(0, 2).map((m) => `«${shortName(m.name)}»`).join(' или ');
-    say(`Кисти нужны два референса, а «${shortName(model.name)}» принимает ${maxRefs()}. Подойдёт ${hint}.`, 'error');
+async function renderSheets() {
+  let docs;
+  try {
+    docs = await db.sheets.list();
+  } catch {
+    el.sheetList.textContent = 'Список недоступен: браузер не дал доступ к IndexedDB.';
     return;
   }
-  el.brushStatus.textContent = '';
-  el.brushStatus.className = 'status';
-  el.brushPrompt.value = '';
-  el.viewer.close();
-  el.brush.showModal();
-  await brush.load(blob);
-  selectColour(brush.PALETTE[0].key);
-  updateLegend();
-}
+  el.sheetList.replaceChildren(...docs.map((d) => {
+    const row = document.createElement('div');
+    row.className = 'sheet-row';
 
-async function runBrush() {
-  const text = el.brushPrompt.value.trim();
-  if (brush.isEmpty()) { el.brushStatus.textContent = 'Сначала закрась область.'; el.brushStatus.className = 'status error'; return; }
-  if (!text) { el.brushStatus.textContent = 'Опиши, что должно быть в этой области.'; el.brushStatus.className = 'status error'; el.brushPrompt.focus(); return; }
-  if (!api.getKey()) { el.brushStatus.textContent = 'Нет ключа OpenRouter.'; el.brushStatus.className = 'status error'; return; }
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'sheet-open';
+    const name = document.createElement('span');
+    name.textContent = d.name;
+    const meta = document.createElement('small');
+    const edits = d.count ? `${d.count} ${plural(d.count, ['правка', 'правки', 'правок'])}` : 'без правок';
+    const when = new Date(d.ts).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+    meta.textContent = `${d.pages} ${plural(d.pages, ['лист', 'листа', 'листов'])} · ${edits} · ${when}`;
+    open.append(name, meta);
+    open.addEventListener('click', () => openSheet(d.id));
 
-  const model = currentModel();
-  const { width, height } = brush.dimensions();
-  const resolution = el.resolution.disabled ? undefined : el.resolution.value;
-
-  state.inflight = new AbortController();
-  el.brushRun.disabled = true;
-  el.brushStatus.textContent = 'Исправляю…';
-  el.brushStatus.className = 'status busy';
-
-  try {
-    const [original, annotated] = await Promise.all([brush.buildOriginal(), brush.buildAnnotated()]);
-    const references = await Promise.all([original, annotated].map(blobToDataUrl));
-    const started = Date.now();
-
-    const res = await api.generate({
-      model: model.id,
-      prompt: brush.buildPrompt(text),
-      references,
-      aspectRatio: closestAspect(width, height),
-      resolution,
-      signal: state.inflight.signal,
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'ghost small danger';
+    del.textContent = '×';
+    del.title = 'Убрать из браузера';
+    del.addEventListener('click', async () => {
+      if (!confirm(`Убрать «${d.name}» и принятые правки из этого браузера? Файл на диске не тронется.`)) return;
+      await db.sheets.remove(d.id).catch(() => {});
+      renderSheets();
     });
 
-    const image = res?.data?.[0];
-    if (!image?.b64_json) throw new Error('Ответ без изображения.');
-
-    let out = base64ToBlob(image.b64_json, image.media_type || 'image/png');
-    let outType = image.media_type || 'image/png';
-    let fit = null;
-    if (el.brushKeep.checked) {
-      ({ blob: out, fit } = await brush.compose(out));   // снаружи маски остаётся оригинал
-      outType = 'image/png';
-    } else {
-      fit = await brush.measure(out);
-    }
-
-    const record = {
-      id: `${started}-${Math.random().toString(36).slice(2, 8)}`,
-      ts: started,
-      model: model.id,
-      modelName: model.name,
-      prompt: text,
-      kind: 'brush',
-      composed: el.brushKeep.checked,
-      aspect: closestAspect(width, height),
-      resolution,
-      cost: res.usage?.cost ?? 0,
-      seconds: Math.round((Date.now() - started) / 1000),
-      outType,
-      out,
-      refs: [annotated],
-    };
-
-    await db.add(record);
-    state.history.unshift(record);
-    renderHistory();
-    updateEstimate();
-    const drift = fit && (Math.abs(fit.tx) > 1 || Math.abs(fit.ty) > 1 || fit.scale !== 1)
-      ? ` · кадр совмещён (сдвиг ${Math.round(fit.tx)}/${Math.round(fit.ty)} px, масштаб ${fit.scale.toFixed(2)})`
-      : '';
-
-    // Модель могла вернуть исходник нетронутым. Со склейкой это даёт кадр,
-    // побитово равный входу, и без проверки выглядело бы как успешная правка —
-    // именно так «ничего не работает» и выглядит снаружи.
-    if (fit && fit.changed < QUIET_CHANGE) {
-      el.brushStatus.textContent = `Модель почти не тронула закрашенное (${fit.changed.toFixed(1)} из 255). Переформулируй или увеличь область — маска сохранена, результат уже в истории.`;
-      el.brushStatus.className = 'status error';
-      say(`Правка не применилась · ${money(record.cost)}`);
-    } else {
-      el.brushStatus.textContent = '';
-      el.brushStatus.className = 'status';
-      el.brush.close();
-      say(`Правка готова за ${record.seconds} с · ${money(record.cost)}${drift}`);
-      openViewer(record.id);
-    }
-    refreshCredits();
-    setTimeout(refreshCredits, 30000);
-  } catch (e) {
-    el.brushStatus.textContent = e.name === 'AbortError' ? 'Отменено.' : (e.message || 'Не получилось.');
-    el.brushStatus.className = 'status error';
-  } finally {
-    state.inflight = null;
-    el.brushRun.disabled = false;
-  }
+    row.append(open, del);
+    return row;
+  }));
 }
 
 /* ── История ───────────────────────────────────────────── */
 
 function renderHistory() {
-  releaseUrls();
+  release(state.gridUrls);
   el.grid.replaceChildren(...state.history.map((rec) => {
     const card = document.createElement('div');
     card.className = 'card';
@@ -576,7 +589,7 @@ function renderHistory() {
     const img = document.createElement('img');
     img.className = 'thumb';
     img.loading = 'lazy';
-    img.src = trackUrl(rec.out);
+    img.src = urlIn(state.gridUrls, rec.out);
     img.alt = rec.prompt.slice(0, 80);
 
     const cap = document.createElement('div');
@@ -585,10 +598,11 @@ function renderHistory() {
     p.textContent = rec.prompt;
     const small = document.createElement('small');
     const when = new Date(rec.ts).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-    const tail = rec.echo
-      ? ' · копия референса'
-      : (rec.kind === 'brush' ? ' · кисть' : (rec.refs.length ? ` · ${rec.refs.length} реф.` : ''));
-    small.textContent = `${when} · ${money(rec.cost)}${tail}`;
+    const tail = rec.echo ? ' · копия референса'
+      : rec.kind === 'sheet' ? ` · лист ${rec.page}`
+      : rec.kind === 'brush' ? ' · кисть'
+      : rec.refs.length ? ` · ${rec.refs.length} реф.` : '';
+    small.textContent = `${when} · ${money(rec.cost)}${tail}${rec.unsaved ? ' · не сохранено' : ''}`;
     cap.append(p, small);
 
     card.append(img, cap);
@@ -597,7 +611,11 @@ function renderHistory() {
     return card;
   }));
 
-  el.empty.hidden = state.history.length > 0;
+  // Правка из редактора может прийти, пока идёт обычная генерация:
+  // её карточка «рисуется…» не должна пропасть.
+  if (state.drawing) showPending(true);
+
+  el.empty.hidden = state.history.length > 0 || state.drawing;
   const spent = state.history.reduce((s, r) => s + (r.cost || 0), 0);
   el.statSpend.textContent = `Потрачено ${money(spent)} · ${state.history.length} шт.`;
 }
@@ -610,12 +628,16 @@ function openViewer(id) {
   const rec = state.history.find((r) => r.id === id);
   if (!rec) return;
   viewing = rec;
+  // Адреса прошлого просмотра отпускаются при следующем открытии. Событие
+  // close приходит позже и убило бы адреса уже открытой следующей записи.
+  release(state.viewerUrls);
 
-  el.viewerImg.src = trackUrl(rec.out);
+  el.viewerImg.src = urlIn(state.viewerUrls, rec.out);
   el.viewerPrompt.textContent = rec.prompt;
 
   const rows = [
     ['Модель', shortName(rec.modelName)],
+    ...(rec.kind === 'sheet' ? [['PDF', `${rec.doc}, лист ${rec.page}`]] : []),
     ['Формат', [rec.resolution, rec.aspect].filter(Boolean).join(' · ') || '—'],
     ['Стоимость', money(rec.cost)],
     ['Время', `${rec.seconds} с`],
@@ -629,25 +651,30 @@ function openViewer(id) {
 
   el.viewerRefs.replaceChildren(...rec.refs.map((blob) => {
     const img = document.createElement('img');
-    img.src = trackUrl(blob);
+    img.src = urlIn(state.viewerUrls, blob);
     img.alt = 'референс';
     return img;
   }));
 
-  el.viewer.showModal();
+  if (!el.viewer.open) el.viewer.showModal();
 }
 
 async function useAsReference() {
   if (!viewing) return;
   const cap = maxRefs();
-  if (state.refs.length >= cap) { say(`Лимит референсов — ${cap}.`, 'error'); return; }
+  if (state.refs.length >= cap) { say(`Лимит референсов: ${cap}.`, 'error'); return; }
 
-  // Через toReference, а не напрямую: у векторных моделей результат — SVG,
-  // его нужно растеризовать, иначе он уйдёт в запрос неподъёмным для модели.
-  const { blob } = await toReference(new File([viewing.out], 'result', { type: viewing.outType }));
-  // Запоминаем, каким промптом получен этот референс: повторная отправка того же
-  // текста — верный способ получить назад его же копию.
-  state.refs.push({ key: ++refKey, blob, url: URL.createObjectURL(blob), name: 'result', fromPrompt: viewing.prompt });
+  try {
+    // Через toReference: у векторных моделей результат SVG,
+    // его нужно растеризовать, иначе он уйдёт в запрос неподъёмным для модели.
+    const { blob } = await toReference(new File([viewing.out], 'result', { type: viewing.outType }));
+    // Запоминаем, каким промптом получен этот референс: повторная отправка того же
+    // текста верный способ получить назад его же копию.
+    state.refs.push({ key: ++refKey, blob, url: URL.createObjectURL(blob), name: 'result', fromPrompt: viewing.prompt });
+  } catch {
+    say('Результат не удалось прочитать как картинку.', 'error');
+    return;
+  }
 
   renderRefs();
   el.viewer.close();
@@ -657,12 +684,14 @@ async function useAsReference() {
 
 function repeatSettings() {
   if (!viewing) return;
-  el.prompt.value = viewing.prompt;
-  if (state.models.some((m) => m.id === viewing.model)) {
-    el.model.value = viewing.model;
+  const rec = viewing;
+  el.prompt.value = rec.prompt;
+  resetRepeat();
+  if (state.models.some((m) => m.id === rec.model)) {
+    el.model.value = rec.model;
     applyModel().then(() => {
-      if (viewing.aspect && !el.aspect.disabled) el.aspect.value = viewing.aspect;
-      if (viewing.resolution && !el.resolution.disabled) el.resolution.value = viewing.resolution;
+      if (rec.aspect && !el.aspect.disabled) el.aspect.value = rec.aspect;
+      if (rec.resolution && !el.resolution.disabled) el.resolution.value = rec.resolution;
       updateEstimate();
     });
   }
@@ -672,7 +701,7 @@ function repeatSettings() {
 
 async function deleteCurrent() {
   if (!viewing) return;
-  await db.remove(viewing.id);
+  await db.remove(viewing.id).catch(() => {});
   state.history = state.history.filter((r) => r.id !== viewing.id);
   renderHistory();
   el.viewer.close();
@@ -683,6 +712,9 @@ async function deleteCurrent() {
 function openSettings() {
   el.apiKey.value = api.getKey();
   el.baseUrl.value = api.getBase();
+  // returnValue живёт между открытиями: без сброса Esc после прошлого
+  // «Сохранить» снова сохранял бы правку поля.
+  el.settings.returnValue = '';
   el.settings.showModal();
 }
 
@@ -691,6 +723,10 @@ function saveSettings() {
   api.setBase(el.baseUrl.value);
   refreshCredits();
   say(api.getKey() ? 'Ключ сохранён.' : 'Ключ удалён.');
+  // Сменился адрес или сеть появилась: список моделей мог не загрузиться при старте.
+  if (!state.models.length) {
+    loadModels().catch((e) => say(`Не удалось загрузить список моделей: ${e.message}`, 'error'));
+  }
 }
 
 async function refreshCredits() {
@@ -728,15 +764,31 @@ function bind() {
   for (const type of ['dragleave', 'drop']) {
     el.dropzone.addEventListener(type, () => el.dropzone.classList.remove('over'));
   }
-  el.dropzone.addEventListener('drop', (e) => { e.preventDefault(); addFiles(e.dataTransfer.files); });
+  el.dropzone.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); addFiles(e.dataTransfer.files); });
   window.addEventListener('dragover', (e) => e.preventDefault());
-  window.addEventListener('drop', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    // PDF, брошенный куда угодно на страницу, открывается в редакторе.
+    if (el.editor.open) return;
+    const pdf = Array.from(e.dataTransfer?.files || []).find(isPdf);
+    if (pdf) openPdfFile(pdf);
+  });
 
   document.addEventListener('paste', (e) => {
+    // В открытом редакторе вставка достаётся выбранной области редактора.
+    if (el.editor.open || el.settings.open) return;
     if (e.clipboardData?.files?.length) addFiles(e.clipboardData.files);
   });
 
+  el.openPdf.addEventListener('click', () => el.pdfInput.click());
+  el.pdfInput.addEventListener('change', () => {
+    const file = el.pdfInput.files?.[0];
+    el.pdfInput.value = '';
+    if (file) openPdfFile(file);
+  });
+
   el.openSettings.addEventListener('click', openSettings);
+  el.cancelSettings.addEventListener('click', () => el.settings.close('cancel'));
   el.settings.addEventListener('close', () => { if (el.settings.returnValue === 'save') saveSettings(); });
 
   el.viewerClose.addEventListener('click', () => el.viewer.close());
@@ -744,30 +796,7 @@ function bind() {
     if (viewing) download(viewing.out, `nanobanana-${viewing.ts}.${extFor(viewing.outType)}`);
   });
   el.viewerToRef.addEventListener('click', useAsReference);
-  el.viewerBrush.addEventListener('click', () => { if (viewing) openBrush(viewing.out); });
-
-  brush.init({
-    canvas: el.brushCanvas,
-    image: el.brushImg,
-    sizeInput: el.brushSize,
-    sizeLabel: el.brushSizeVal,
-  });
-  buildSwatches();
-  el.brushSize.addEventListener('input', () => brush.setSize(Number(el.brushSize.value)));
-  el.brushUndo.addEventListener('click', () => { brush.undo(); updateLegend(); });
-  el.brushClear.addEventListener('click', () => { brush.clear(); updateLegend(); });
-  el.brushCanvas.addEventListener('pointerup', updateLegend);
-  el.brushMode.addEventListener('click', () => {
-    brush.setErase(!brush.isErasing());
-    el.brushMode.classList.toggle('active', brush.isErasing());
-    el.brushMode.textContent = brush.isErasing() ? 'Кисть' : 'Ластик';
-  });
-  el.brushRun.addEventListener('click', runBrush);
-  el.brushCancel.addEventListener('click', () => el.brush.close());
-  el.brush.addEventListener('close', () => state.inflight?.abort());
-  el.brushPrompt.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') runBrush();
-  });
+  el.viewerBrush.addEventListener('click', () => { if (viewing) openEditor(viewing.out, 'результат'); });
   el.viewerRepeat.addEventListener('click', repeatSettings);
   el.viewerDelete.addEventListener('click', deleteCurrent);
 
@@ -798,7 +827,7 @@ async function checkBuild() {
     sessionStorage.setItem('nb.reloadedFor', build);
     location.reload();
   } catch {
-    // Нет сети или файла — не повод мешать работе.
+    // Нет сети или файла: не повод мешать работе.
   }
 }
 
@@ -808,6 +837,7 @@ async function init() {
   checkBuild();
   bind();
   renderRefs();
+  renderSheets();
   try {
     state.history = await db.all();
     renderHistory();

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nano banana</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍌</text></svg>">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=202611090903">
 </head>
 <body>
 
@@ -41,7 +41,7 @@
 
     <div class="field">
       <label for="prompt">Промпт</label>
-      <textarea id="prompt" rows="6" placeholder="Что сгенерировать. Если приложены референсы — опиши, что с ними сделать."></textarea>
+      <textarea id="prompt" rows="6" placeholder="Что сгенерировать. Если приложены референсы, опиши, что с ними сделать."></textarea>
     </div>
 
     <div class="field">
@@ -49,13 +49,12 @@
       <div class="dropzone" id="dropzone" tabindex="0" role="button">
         Перетащи файлы, вставь из буфера (⌘V) или нажми, чтобы выбрать
       </div>
-      <input type="file" id="file-input" accept="image/*" multiple hidden>
+      <input type="file" id="file-input" accept="image/*,application/pdf,.pdf" multiple hidden>
       <div class="refs" id="refs"></div>
       <p class="hint" id="ref-hint" hidden>
-        Промпт должен говорить, ЧТО СДЕЛАТЬ с референсом, а не описывать его:
-        «помести логотип с референса на белую кружку», а не «оранжевый круг
-        с треугольником». Описание приложенного модель понимает как просьбу
-        вернуть его же.
+        Промпт должен говорить, ЧТО СДЕЛАТЬ с референсом: «помести логотип
+        с референса на белую кружку». Описание приложенного («оранжевый круг
+        с треугольником») модель понимает как просьбу вернуть его же.
       </p>
     </div>
 
@@ -65,6 +64,18 @@
     </div>
     <p class="hint" id="estimate"></p>
     <p class="status" id="status" role="status"></p>
+
+    <div class="field sheets">
+      <label>Листы PDF</label>
+      <button class="ghost" id="open-pdf">Открыть PDF…</button>
+      <input type="file" id="pdf-input" accept="application/pdf,.pdf" hidden>
+      <div class="sheet-list" id="sheet-list"></div>
+      <p class="hint">
+        Закрась на листе, что исправить, напиши для области, что там должно
+        быть, и приложи референс. Принятые правки заменяют участки листов,
+        «Сохранить PDF» собирает документ. PDF можно и просто бросить на страницу.
+      </p>
+    </div>
   </section>
 
   <!-- ПРАВАЯ КОЛОНКА: результаты -->
@@ -87,7 +98,7 @@
       <input type="password" id="api-key" placeholder="sk-or-v1-..." autocomplete="off" spellcheck="false">
       <p class="hint">
         Ключ хранится только в localStorage этого браузера и уходит напрямую в openrouter.ai.
-        В репозиторий он не попадает. Создать или отозвать —
+        В репозиторий он не попадает. Создать или отозвать:
         <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noopener">openrouter.ai/settings/keys</a>.
       </p>
       <p class="hint">Сборка <span id="build-id">—</span></p>
@@ -101,7 +112,8 @@
       </div>
     </details>
     <div class="dialog-actions">
-      <button class="ghost" value="cancel">Отмена</button>
+      <!-- «Отмена» не кнопка формы: Enter в поле ключа должен сохранять. -->
+      <button type="button" class="ghost" id="cancel-settings">Отмена</button>
       <button class="primary" id="save-settings" value="save">Сохранить</button>
     </div>
   </form>
@@ -127,60 +139,132 @@
   <button class="viewer-close" id="viewer-close" aria-label="Закрыть">×</button>
 </dialog>
 
-<!-- Кисть: локальная правка отмеченной области -->
-<dialog id="brush">
-  <div class="brush-body">
-    <div class="brush-stage">
-      <img id="brush-img" alt="">
-      <canvas id="brush-canvas"></canvas>
-    </div>
-    <div class="brush-side">
-      <h2>Исправить область</h2>
-      <p class="hint">
-        Закрась то, что нужно изменить — целиком. Незакрашенное сохранится
-        как есть, даже если это остаток того же объекта.
-      </p>
+<!-- Редактор правок: картинка или листы PDF -->
+<dialog id="editor">
+  <div class="ed-body">
+    <aside class="ed-pages" id="ed-pages" hidden></aside>
 
-      <div class="field">
-        <label>Цвет пометки</label>
-        <div class="swatches" id="brush-colors"></div>
+    <section class="ed-main">
+      <div class="ed-toolbar">
+        <div class="ed-group" id="ed-tools">
+          <button class="ghost small" data-tool="brush" title="Кисть · B">Кисть</button>
+          <button class="ghost small" data-tool="rect" title="Прямоугольная область · R">Рамка</button>
+          <button class="ghost small" data-tool="erase" title="Ластик · E">Ластик</button>
+          <button class="ghost small" data-tool="hand" title="Рука · H, или держи пробел">Рука</button>
+        </div>
+        <div class="swatches" id="ed-colors"></div>
+        <label class="ed-size" title="Размер кисти · [ и ]">
+          <input type="range" id="ed-size" min="2" max="400" step="1">
+          <span class="counter" id="ed-size-val"></span>
+        </label>
+        <div class="ed-group">
+          <button class="ghost small" id="ed-undo" title="⌘Z">Отменить</button>
+          <button class="ghost small" id="ed-clear">Стереть всё</button>
+        </div>
+        <div class="ed-group">
+          <button class="ghost small" id="ed-zoom-out" title="Мельче · −">−</button>
+          <button class="ghost small ed-zoom-val" id="ed-zoom-val" title="Вписать · 0">100%</button>
+          <button class="ghost small" id="ed-zoom-in" title="Крупнее · +">+</button>
+        </div>
+      </div>
+
+      <div class="ed-stage" id="ed-stage" tabindex="-1">
+        <div class="ed-sheet" id="ed-sheet">
+          <canvas id="ed-base"></canvas>
+          <canvas id="ed-detail" class="ed-place" hidden></canvas>
+          <canvas id="ed-preview" class="ed-place" hidden></canvas>
+          <canvas id="ed-marks"></canvas>
+          <div class="ed-rect" id="ed-rect" hidden></div>
+        </div>
+        <div class="ed-cursor" id="ed-cursor" hidden></div>
+        <div class="ed-loading" id="ed-loading" hidden>Загружаю…</div>
+        <p class="ed-help">Колесо или два пальца: прокрутка · ⌘ + колесо или щипок: масштаб · пробел + мышь: рука</p>
+      </div>
+    </section>
+
+    <aside class="ed-side">
+      <div class="ed-head">
+        <div>
+          <h2 id="ed-title">Правка</h2>
+          <p class="hint" id="ed-sub"></p>
+        </div>
+        <button class="ed-close" id="ed-close" aria-label="Закрыть">×</button>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label for="ed-model">Модель</label>
+          <select id="ed-model"></select>
+        </div>
+        <div class="field">
+          <label for="ed-resolution">Разрешение</label>
+          <select id="ed-resolution"></select>
+        </div>
       </div>
 
       <div class="field">
-        <label for="brush-size">Кисть <span class="counter" id="brush-size-val"></span></label>
-        <input type="range" id="brush-size" min="4" max="400" step="2">
-      </div>
-
-      <div class="brush-tools">
-        <button class="ghost small" id="brush-mode">Ластик</button>
-        <button class="ghost small" id="brush-undo">Отменить</button>
-        <button class="ghost small" id="brush-clear">Сбросить</button>
+        <label>Области</label>
+        <div class="ed-regions" id="ed-regions"></div>
+        <p class="hint" id="ed-regions-hint">
+          Закрась на листе, что исправить: кистью или рамкой, разными цветами для
+          разных правок. Для каждой области напиши, что там должно быть, и при
+          желании приложи референс: перетащи картинку на область или вставь ⌘V.
+        </p>
       </div>
 
       <div class="field">
-        <label for="brush-prompt">Что сделать с закрашенным</label>
-        <textarea id="brush-prompt" rows="4" placeholder="Пурпурное замени на дерево. Голубое убери."></textarea>
-        <p class="hint" id="brush-legend"></p>
+        <label for="ed-general">Общее указание</label>
+        <textarea id="ed-general" rows="2" placeholder="Необязательно. Например: сохрани толщину линий и шрифт."></textarea>
+      </div>
+
+      <div class="field">
+        <label>Кадр для модели</label>
+        <div class="seg" id="ed-frame">
+          <button type="button" data-frame="around">Вокруг пометок</button>
+          <button type="button" data-frame="whole">Весь лист</button>
+        </div>
+        <p class="hint" id="ed-frame-hint"></p>
       </div>
 
       <label class="check">
-        <input type="checkbox" id="brush-keep" checked>
+        <input type="checkbox" id="ed-keep" checked>
         Оставить остальное нетронутым
       </label>
       <p class="hint">
-        Результат склеивается с оригиналом по маске, поэтому за пределами закраски
-        пиксели не меняются. Выключи, если правка должна выходить за границу выделения.
+        Ответ модели склеивается с оригиналом по маске: за пределами закраски
+        ничего не меняется. Сними, если правка должна выходить за границу.
       </p>
 
-      <div class="brush-actions">
-        <button class="primary" id="brush-run">Исправить</button>
-        <button class="ghost" id="brush-cancel">Отмена</button>
+      <p class="hint" id="ed-count"></p>
+
+      <div class="ed-actions">
+        <button class="primary" id="ed-run">Исправить</button>
+        <button class="ghost" id="ed-stop" hidden>Остановить</button>
       </div>
-      <p class="status" id="brush-status" role="status"></p>
-    </div>
+      <div class="ed-result" id="ed-result" hidden>
+        <div class="ed-actions">
+          <button class="primary" id="ed-accept">Принять</button>
+          <button class="ghost" id="ed-compare" title="C">Показать до</button>
+        </div>
+        <div class="ed-actions">
+          <button class="ghost" id="ed-again">Ещё вариант</button>
+          <button class="ghost" id="ed-reject">Отклонить</button>
+        </div>
+      </div>
+      <p class="status" id="ed-status" role="status"></p>
+
+      <div class="ed-doc" id="ed-doc" hidden>
+        <p class="hint" id="ed-doc-info"></p>
+        <div class="ed-actions">
+          <button class="primary" id="ed-save">Сохранить PDF</button>
+          <button class="ghost" id="ed-revert" hidden>Откатить правку листа</button>
+        </div>
+      </div>
+    </aside>
   </div>
+  <input type="file" id="ed-ref-input" accept="image/*" multiple hidden>
 </dialog>
 
-<script type="module" src="js/app.js?v=202609161324"></script>
+<script type="module" src="js/app.js?v=202611090903"></script>
 </body>
 </html>
