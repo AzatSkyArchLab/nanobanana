@@ -362,6 +362,12 @@ async function saveRecord(record) {
   }
 }
 
+/** Запись уже в истории, но её картинка сменилась (другая граница склейки). */
+async function updateRecord(record) {
+  renderHistory();
+  if (!record.unsaved) await db.put(record).catch(() => {});
+}
+
 async function generate() {
   // ⌘Enter работает и при заблокированной кнопке: второй запрос сюда не пускаем.
   if (state.inflight) return;
@@ -501,6 +507,7 @@ function editorModule() {
         busyText,
         plural,
         saveRecord,
+        updateRecord,
         refreshCredits,
         openViewer,
         onSheetsChanged: renderSheets,

@@ -11,18 +11,24 @@
 // пропорции, которые принимает модель; поле за краем листа дополняется белым.
 
 const V = new URL(import.meta.url).search;   // см. комментарий в app.js
-const [marksLib, patchLib, promptLib, pdfLib, images, db] = await Promise.all([
+const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db] = await Promise.all([
   import('./marks.js' + V),
   import('./patch.js' + V),
+  import('./align.js' + V),
   import('./prompt.js' + V),
   import('./pdfdoc.js' + V),
   import('./images.js' + V),
   import('./db.js' + V),
 ]);
 const { PALETTE, Marks, colour, blank, frameOf, paintAll, paintStroke } = marksLib;
-const { makePatch, opaqueBox, cut, toPng } = patchLib;
+const {
+  BOUNDARIES, place, changeInside, growMask, toneOf, softEdge, softFrame, composeWith, opaqueBox, cut, toPng,
+} = patchLib;
+const { estimateAlignment } = alignLib;
 const { buildEditPrompt, describe } = promptLib;
 const { toReference, blobToDataUrl, base64ToBlob, rasterize, isImage, download } = images;
+
+const LS_BOUNDARY = 'nb.boundary';
 
 const SHEET_EDGE = 2048;    // экранный размер листа и слой пометок по длинной стороне
 const BASE_EDGE = 3072;     // растр листа PDF для показа
@@ -49,9 +55,10 @@ const S = {
   color: PALETTE[0].key,
   size: 48,         // пиксели слоя пометок
   frame: 'whole',
+  boundary: 'grow', // граница склейки, см. patch.js
   view: { z: 1, x: 0, y: 0, fit: 1 },
   busy: null,       // AbortController текущего запроса
-  pending: null,    // результат, ждущий решения
+  pending: null,    // результат, ждущий решения: { base, view, record }
   compare: false,
   accepted: null,   // запись истории последней принятой правки картинки
   draw: null,
@@ -113,7 +120,8 @@ export function init(context) {
     title: $('ed-title'), sub: $('ed-sub'), close: $('ed-close'),
     model: $('ed-model'), resolution: $('ed-resolution'),
     regions: $('ed-regions'), regionsHint: $('ed-regions-hint'), general: $('ed-general'),
-    frame: $('ed-frame'), frameHint: $('ed-frame-hint'), keep: $('ed-keep'), count: $('ed-count'),
+    frame: $('ed-frame'), frameHint: $('ed-frame-hint'),
+    boundary: $('ed-boundary'), boundaryHint: $('ed-boundary-hint'), count: $('ed-count'),
     run: $('ed-run'), stop: $('ed-stop'),
     result: $('ed-result'), accept: $('ed-accept'), compare: $('ed-compare'), again: $('ed-again'), reject: $('ed-reject'),
     status: $('ed-status'), doc: $('ed-doc'), docInfo: $('ed-doc-info'), save: $('ed-save'), revert: $('ed-revert'),
@@ -124,6 +132,9 @@ export function init(context) {
   bindPanel();
   setSize(S.size);
   setTool('brush');
+  let saved = null;
+  try { saved = localStorage.getItem(LS_BOUNDARY); } catch { /* хранилище недоступно */ }
+  setBoundary(BOUNDARIES.includes(saved) ? saved : 'grow', false);
 }
 
 export const isOpen = () => !!ui?.dialog.open;
@@ -149,6 +160,7 @@ function reset() {
   S.pages = [];
   S.page = 0;
   S.visited = [];
+  S.pending?.base.result.close?.();
   S.pending = null;
   S.compare = false;
   S.accepted = null;
@@ -199,7 +211,6 @@ export async function openImage(blob, name = 'картинка') {
     S.src = { kind: 'image', name, image };
     S.pages = [pageState(image.width, image.height)];
     setFrame('whole');
-    ui.keep.checked = true;
     await showPage(0);
   } catch (e) {
     status(e.message || 'Картинка не открылась.', 'error');
@@ -245,7 +256,6 @@ export async function openSheet(id, preloaded = null) {
     S.src = { kind: 'pdf', name: saved.doc.name, doc, bytes, meta: saved.doc, patches: saved.patches };
     S.pages = sizes.map(({ width, height }) => pageState(width, height));
     setFrame('around');
-    ui.keep.checked = true;
     buildStrip();
     renderDocInfo();
     await showPage(Math.min(saved.doc.lastPage || 0, doc.count - 1));
@@ -591,8 +601,33 @@ function setFrame(mode) {
       ? 'В модель уйдёт фрагмент вокруг пометок в полном разрешении: мелкие детали листа сохраняются.'
       : 'В модель уйдёт фрагмент вокруг пометок.')
     : (pdf
-      ? 'В модель уйдёт весь лист: годится для правок по всему листу, мелкие детали теряются. Со снятой галочкой ниже лист заменяется ответом модели целиком.'
+      ? 'В модель уйдёт весь лист: годится для правок по всему листу, мелкие детали теряются. С границей «весь кадр» лист заменяется ответом модели целиком.'
       : 'В модель уйдёт вся картинка.');
+  renderBoundaryHint();
+}
+
+/**
+ * Граница склейки. Её можно сменить и после ответа: ответ модели хранится,
+ * склейка пересчитывается без нового запроса.
+ */
+async function setBoundary(mode, refresh = true) {
+  S.boundary = mode;
+  try { localStorage.setItem(LS_BOUNDARY, mode); } catch { /* хранилище недоступно */ }
+  for (const b of ui.boundary.children) b.classList.toggle('active', b.dataset.boundary === mode);
+  renderBoundaryHint();
+  if (refresh && S.pending && !S.busy) await recompose();
+}
+
+function renderBoundaryHint() {
+  const pdf = S.src?.kind === 'pdf';
+  const text = {
+    grow: 'Берётся пометка и всё, что модель дорисовала вплотную к ней: объект шире пометки входит целиком. Остальное остаётся как было.',
+    mark: 'Берётся строго закрашенное, за его пределами пиксели не меняются.',
+    frame: S.frame === 'whole'
+      ? (pdf ? 'Берётся весь ответ модели: лист заменяется целиком.' : 'Берётся весь ответ модели как есть.')
+      : 'Берётся весь фрагмент, который видела модель, с растушёванными краями.',
+  };
+  ui.boundaryHint.textContent = `${text[S.boundary]} Границу можно сменить и после ответа, без нового запроса.`;
 }
 
 /* ── Области ───────────────────────────────────────────── */
@@ -942,27 +977,30 @@ async function run() {
     };
 
     status('Совмещаю результат с оригиналом…', 'busy');
-    let done;
+    let base = null;
+    let shown;
     try {
-      done = await finish(P, job, raw, ctrl.signal);
+      base = await align(P, job, raw, ctrl.signal);
+      shown = await view(P, base, S.boundary);
     } catch (e) {
+      base?.result.close?.();
       // За ответ уже заплачено: он уходит в историю как есть.
       await app.saveRecord(record);
       throw new Error(`Ответ получен и сохранён в истории, но склейка не удалась: ${e.message || e}`);
     }
-    record.out = done.out;
-    record.outType = done.outType;
-    record.composed = done.keep;
+    record.out = shown.out;
+    record.outType = shown.outType;
+    record.composed = shown.boundary !== 'frame';
     await app.saveRecord(record);
     app.refreshCredits();
     setTimeout(app.refreshCredits, 30000);
 
-    S.pending = { ...done, record };
+    S.pending = { base, view: shown, record, busy: false };
     showPending();
-    if (done.changed < QUIET_CHANGE) {
-      status(`Модель почти не тронула закрашенное (${done.changed.toFixed(1)} из 255) · ${app.money(cost)}. Переформулируй или увеличь область: пометки сохранены, ответ в истории.`, 'error');
+    if (base.changed < QUIET_CHANGE) {
+      status(`Модель почти не тронула закрашенное (${base.changed.toFixed(1)} из 255) · ${app.money(cost)}. Переформулируй или увеличь область: пометки сохранены, ответ в истории.`, 'error');
     } else {
-      status(`Готово за ${seconds} с · ${app.money(cost)}${describeFit(done.fit)}. Сравни до и после, затем прими или отклони.`);
+      status(`Готово за ${seconds} с · ${app.money(cost)}${describeFit(base.fit)}${describeView(shown)}${describeSoft(base)}. Сравни до и после, затем прими или отклони.`);
     }
   } catch (e) {
     if (e.name === 'AbortError' || ctrl.signal.aborted) status('Остановлено.');
@@ -973,6 +1011,8 @@ async function run() {
   }
 }
 
+const BOUNDARY_NAMES = { grow: 'по изменениям', mark: 'по пометке', frame: 'весь кадр' };
+
 function describeFit(fit) {
   if (!fit) return '';
   const moved = Math.abs(fit.tx) > 1 || Math.abs(fit.ty) > 1 || Math.abs(fit.sx - 1) > 0.002 || Math.abs(fit.sy - 1) > 0.002;
@@ -981,26 +1021,28 @@ function describeFit(fit) {
     : '';
 }
 
-/** Склейка ответа и подготовка заплатки для листа или картинки. */
-async function finish(P, job, raw, signal) {
+function describeView(v) {
+  const parts = [];
+  if (v.boundary === 'grow' && v.grew > 0.05) parts.push(`граница по изменениям шире пометки на ${Math.round(v.grew * 100)} %`);
+  if (v.tone) parts.push('тон подогнан под оригинал');
+  return parts.length ? ` · ${parts.join(', ')}` : '';
+}
+
+function describeSoft(b) {
+  return b.soft
+    ? ` · ответ модели ${b.soft.model} px мельче кадра ${b.soft.frame} px, внутри правки будет мягче: для резкости выбери разрешение крупнее`
+    : '';
+}
+
+/**
+ * Совмещение ответа с оригиналом. Делается один раз на ответ: граница
+ * склейки потом меняется без него.
+ */
+async function align(P, job, raw, signal) {
   const pdf = S.src.kind === 'pdf';
-  const keep = ui.keep.checked;
   const result = await createImageBitmap(await rasterize(raw, COMPOSE_MAX));
   try {
     const [bx, by, bw, bh] = job.box;
-
-    // Картинка целиком без склейки: ответ модели как есть, как и раньше.
-    if (!pdf && !keep && job.wholePage) {
-      const view = blank(P.w, P.h);
-      view.getContext('2d').drawImage(result, 0, 0, P.w, P.h);
-      const fit = { sx: 1, sy: 1, tx: 0, ty: 0 };
-      const mask = P.marks.union(frameOf(1, 0, 0, P.w, P.h));
-      const changed = patchLib.changeInside(S.src.image, view, mask);
-      const outType = raw.type === 'image/svg+xml' ? 'image/png' : raw.type;
-      const out = raw.type === 'image/svg+xml' ? await toPng(view) : raw;
-      return { keep, fit, changed, out, outType, preview: { canvas: view, x: 0, y: 0, w: P.w, h: P.h } };
-    }
-
     let comp;
     if (pdf) {
       const long = Math.min(COMPOSE_MAX, Math.max(SEND_EDGE, result.width, result.height));
@@ -1012,71 +1054,135 @@ async function finish(P, job, raw, signal) {
     const same = comp.w === job.send.w && comp.h === job.send.h;
     const original = same ? job.original : await renderFrame(comp, signal);
     const mask = P.marks.union(comp);
-    const { fit, changed, patch, composed } = makePatch({
-      original, result, mask, keep, edges: !keep && !job.wholePage,
-    });
-
-    if (pdf) {
-      // Часть кадра, которая приходится на лист: поле за краем не нужно.
-      const px0 = Math.max(0, Math.round(-bx * comp.k));
-      const py0 = Math.max(0, Math.round(-by * comp.k));
-      const px1 = Math.min(comp.w, Math.round((P.w - bx) * comp.k));
-      const py1 = Math.min(comp.h, Math.round((P.h - by) * comp.k));
-      const pageBox = [px0, py0, px1 - px0, py1 - py0];
-      const full = !keep && job.wholePage;
-      let box = pageBox;
-      if (!full) {
-        const o = opaqueBox(patch) || pageBox;
-        const x0 = Math.max(o[0], px0);
-        const y0 = Math.max(o[1], py0);
-        const x1 = Math.min(o[0] + o[2], px1);
-        const y1 = Math.min(o[1] + o[3], py1);
-        box = [x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0)];
-      }
-      const piece = cut(patch, box);
-      const rect = full
-        ? { x: 0, y: 0, w: P.w, h: P.h }
-        : { x: bx + box[0] / comp.k, y: by + box[1] / comp.k, w: box[2] / comp.k, h: box[3] / comp.k };
-      const [out, blob] = await Promise.all([toPng(cut(composed, pageBox)), toPng(piece)]);
-      return {
-        keep, fit, changed, full, out,
-        outType: 'image/png',
-        patch: { ...rect, full, blob },
-        preview: { canvas: piece, ...rect },
-      };
-    }
-
-    // Картинка: заплатка вклеивается в полный кадр в родном разрешении.
-    const whole = blank(P.w, P.h);
-    const wctx = whole.getContext('2d');
-    wctx.drawImage(S.src.image, 0, 0);
-    wctx.drawImage(patch, bx, by);
-    const o = opaqueBox(patch) || [0, 0, patch.width, patch.height];
+    const fit = estimateAlignment(original, result, mask, comp.w, comp.h);
+    const aligned = place(result, fit, comp.w, comp.h);
+    const changed = changeInside(original, aligned, mask);
+    const modelLong = Math.max(result.width, result.height);
+    const frameLong = Math.max(comp.w, comp.h);
     return {
-      keep, fit, changed,
-      out: await toPng(whole),
-      outType: 'image/png',
-      preview: { canvas: cut(patch, o), x: bx + o[0], y: by + o[1], w: o[2], h: o[3] },
+      pdf, job, comp, original, mask, aligned, fit, changed, raw, result, grown: null,
+      soft: modelLong < frameLong * 0.8 ? { model: modelLong, frame: frameLong } : null,
     };
-  } finally {
+  } catch (e) {
     result.close?.();
+    throw e;
+  }
+}
+
+/**
+ * Вид результата для границы склейки: заплатка для листа, превью и файл
+ * для истории. Пересчитывается при смене границы без нового запроса.
+ */
+async function view(P, b, boundary) {
+  const [bx, by] = b.job.box;
+
+  // Картинка целиком с границей «весь кадр»: ответ модели как есть.
+  if (!b.pdf && boundary === 'frame' && b.job.wholePage) {
+    const canvas = blank(P.w, P.h);
+    canvas.getContext('2d').drawImage(b.result, 0, 0, P.w, P.h);
+    const svg = b.raw.type === 'image/svg+xml';
+    return {
+      boundary, grew: 0, tone: false,
+      out: svg ? await toPng(canvas) : b.raw,
+      outType: svg ? 'image/png' : b.raw.type,
+      preview: { canvas, x: 0, y: 0, w: P.w, h: P.h },
+    };
+  }
+
+  let region = b.mask;
+  let grew = 0;
+  if (boundary === 'grow') {
+    if (!b.grown) b.grown = growMask(b.original, b.aligned, b.mask);
+    region = b.grown.canvas;
+    grew = b.grown.grew;
+  }
+  const full = boundary === 'frame' && b.job.wholePage;   // лист PDF заменяется целиком
+  const alpha = boundary === 'frame' ? (full ? null : softFrame(b.comp.w, b.comp.h)) : softEdge(region);
+  // Тон считается там, где модель не должна была ничего менять.
+  const tone = toneOf(b.original, b.aligned, boundary === 'frame' ? b.mask : region);
+  const { patch, composed } = composeWith({ original: b.original, aligned: b.aligned, alpha, tone });
+
+  if (b.pdf) {
+    const { comp } = b;
+    // Часть кадра, которая приходится на лист: поле за краем не нужно.
+    const px0 = Math.max(0, Math.round(-bx * comp.k));
+    const py0 = Math.max(0, Math.round(-by * comp.k));
+    const px1 = Math.min(comp.w, Math.round((P.w - bx) * comp.k));
+    const py1 = Math.min(comp.h, Math.round((P.h - by) * comp.k));
+    const pageBox = [px0, py0, px1 - px0, py1 - py0];
+    let box = pageBox;
+    if (!full) {
+      const o = opaqueBox(patch) || pageBox;
+      const x0 = Math.max(o[0], px0);
+      const y0 = Math.max(o[1], py0);
+      const x1 = Math.min(o[0] + o[2], px1);
+      const y1 = Math.min(o[1] + o[3], py1);
+      box = [x0, y0, Math.max(1, x1 - x0), Math.max(1, y1 - y0)];
+    }
+    const piece = cut(patch, box);
+    const rect = full
+      ? { x: 0, y: 0, w: P.w, h: P.h }
+      : { x: bx + box[0] / comp.k, y: by + box[1] / comp.k, w: box[2] / comp.k, h: box[3] / comp.k };
+    const [out, blob] = await Promise.all([toPng(cut(composed, pageBox)), toPng(piece)]);
+    return {
+      boundary, grew, tone: !!tone, full, out,
+      outType: 'image/png',
+      patch: { ...rect, full, blob },
+      preview: { canvas: piece, ...rect },
+    };
+  }
+
+  // Картинка: заплатка вклеивается в полный кадр в родном разрешении.
+  const whole = blank(P.w, P.h);
+  const wctx = whole.getContext('2d');
+  wctx.drawImage(S.src.image, 0, 0);
+  wctx.drawImage(patch, bx, by);
+  const o = opaqueBox(patch) || [0, 0, patch.width, patch.height];
+  return {
+    boundary, grew, tone: !!tone,
+    out: await toPng(whole),
+    outType: 'image/png',
+    preview: { canvas: cut(patch, o), x: bx + o[0], y: by + o[1], w: o[2], h: o[3] },
+  };
+}
+
+/** Смена границы при показанном результате: новый вид из того же ответа. */
+async function recompose() {
+  const p = S.pending;
+  if (!p || p.busy) return;
+  p.busy = true;
+  status('Пересчитываю склейку…', 'busy');
+  try {
+    const shown = await view(cur(), p.base, S.boundary);
+    if (S.pending !== p) return;
+    p.view = shown;
+    p.record.out = shown.out;
+    p.record.outType = shown.outType;
+    p.record.composed = shown.boundary !== 'frame';
+    app.updateRecord(p.record);
+    showPending();
+    status(`Граница склейки: ${BOUNDARY_NAMES[shown.boundary]}${describeView(shown)}. Сравни до и после, затем прими или отклони.`);
+  } catch (e) {
+    status(e.message || 'Склейка не пересчиталась.', 'error');
+  } finally {
+    p.busy = false;
   }
 }
 
 /* ── Результат ─────────────────────────────────────────── */
 
 function showPending() {
-  const p = S.pending;
+  const { preview } = S.pending.view;
   const P = cur();
-  const c = p.preview.canvas;
+  const c = preview.canvas;
   ui.preview.width = c.width;
   ui.preview.height = c.height;
   ui.preview.getContext('2d').drawImage(c, 0, 0);
   Object.assign(ui.preview.style, {
-    left: `${p.preview.x * P.k}px`,
-    top: `${p.preview.y * P.k}px`,
-    width: `${p.preview.w * P.k}px`,
-    height: `${p.preview.h * P.k}px`,
+    left: `${preview.x * P.k}px`,
+    top: `${preview.y * P.k}px`,
+    width: `${preview.w * P.k}px`,
+    height: `${preview.h * P.k}px`,
   });
   S.compare = false;
   ui.preview.hidden = false;
@@ -1090,6 +1196,7 @@ function showPending() {
 }
 
 function clearPending() {
+  S.pending?.base.result.close?.();
   S.pending = null;
   S.compare = false;
   ui.preview.hidden = true;
@@ -1109,7 +1216,7 @@ function toggleCompare() {
 }
 
 async function accept() {
-  if (!S.pending || S.busy) return;
+  if (!S.pending || S.busy || S.pending.busy) return;
   if (S.src.kind === 'pdf') await acceptSheet();
   else await acceptImage();
 }
@@ -1120,8 +1227,8 @@ async function acceptSheet() {
   const src = S.src;
   const patch = {
     id: rid(), doc: src.meta.id, page: S.page,
-    x: p.patch.x, y: p.patch.y, w: p.patch.w, h: p.patch.h,
-    full: p.patch.full, blob: p.patch.blob, ts: Date.now(), record: p.record.id,
+    x: p.view.patch.x, y: p.view.patch.y, w: p.view.patch.w, h: p.view.patch.h,
+    full: p.view.patch.full, blob: p.view.patch.blob, ts: Date.now(), record: p.record.id,
   };
   src.patches.push(patch);
   src.meta.count = src.patches.length;
@@ -1411,6 +1518,7 @@ async function renderDetail() {
 function bindPanel() {
   for (const b of ui.tools.querySelectorAll('[data-tool]')) b.addEventListener('click', () => setTool(b.dataset.tool));
   for (const b of ui.frame.querySelectorAll('[data-frame]')) b.addEventListener('click', () => setFrame(b.dataset.frame));
+  for (const b of ui.boundary.querySelectorAll('[data-boundary]')) b.addEventListener('click', () => setBoundary(b.dataset.boundary));
   ui.size.addEventListener('input', () => setSize(Number(ui.size.value)));
   ui.undo.addEventListener('click', undo);
   ui.clear.addEventListener('click', clearMarks);

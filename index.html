@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nano banana</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍌</text></svg>">
-<link rel="stylesheet" href="styles.css?v=202611090903">
+<link rel="stylesheet" href="styles.css?v=202611090952">
 </head>
 <body>
 
@@ -226,14 +226,15 @@
         <p class="hint" id="ed-frame-hint"></p>
       </div>
 
-      <label class="check">
-        <input type="checkbox" id="ed-keep" checked>
-        Оставить остальное нетронутым
-      </label>
-      <p class="hint">
-        Ответ модели склеивается с оригиналом по маске: за пределами закраски
-        ничего не меняется. Сними, если правка должна выходить за границу.
-      </p>
+      <div class="field">
+        <label>Граница правки</label>
+        <div class="seg" id="ed-boundary">
+          <button type="button" data-boundary="grow">По изменениям</button>
+          <button type="button" data-boundary="mark">По пометке</button>
+          <button type="button" data-boundary="frame">Весь кадр</button>
+        </div>
+        <p class="hint" id="ed-boundary-hint"></p>
+      </div>
 
       <p class="hint" id="ed-count"></p>
 
@@ -265,6 +266,6 @@
   <input type="file" id="ed-ref-input" accept="image/*" multiple hidden>
 </dialog>
 
-<script type="module" src="js/app.js?v=202611090903"></script>
+<script type="module" src="js/app.js?v=202611090952"></script>
 </body>
 </html>
