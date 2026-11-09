@@ -22,7 +22,7 @@ const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db] = await Prom
 ]);
 const { PALETTE, Marks, colour, blank, frameOf, paintAll, paintStroke } = marksLib;
 const {
-  BOUNDARIES, place, changeInside, growMask, toneOf, softEdge, softFrame, composeWith, opaqueBox, cut, toPng,
+  place, changeInside, growMask, toneOf, softEdge, softFrame, composeWith, opaqueBox, cut, toPng,
 } = patchLib;
 const { estimateAlignment } = alignLib;
 const { buildEditPrompt, describe } = promptLib;
@@ -132,9 +132,18 @@ export function init(context) {
   bindPanel();
   setSize(S.size);
   setTool('brush');
+  setBoundary(usualBoundary(), false);
+}
+
+/**
+ * Обычная граница: последняя выбранная из «по изменениям» и «по пометке».
+ * «Весь кадр» решение на одну правку и не запоминается: иначе следующая
+ * правка молча взяла бы весь ответ модели вместе с перекраской вокруг.
+ */
+function usualBoundary() {
   let saved = null;
   try { saved = localStorage.getItem(LS_BOUNDARY); } catch { /* хранилище недоступно */ }
-  setBoundary(BOUNDARIES.includes(saved) ? saved : 'grow', false);
+  return saved === 'mark' ? 'mark' : 'grow';
 }
 
 export const isOpen = () => !!ui?.dialog.open;
@@ -612,7 +621,9 @@ function setFrame(mode) {
  */
 async function setBoundary(mode, refresh = true) {
   S.boundary = mode;
-  try { localStorage.setItem(LS_BOUNDARY, mode); } catch { /* хранилище недоступно */ }
+  if (mode !== 'frame') {
+    try { localStorage.setItem(LS_BOUNDARY, mode); } catch { /* хранилище недоступно */ }
+  }
   for (const b of ui.boundary.children) b.classList.toggle('active', b.dataset.boundary === mode);
   renderBoundaryHint();
   if (refresh && S.pending && !S.busy) await recompose();
@@ -1219,6 +1230,7 @@ async function accept() {
   if (!S.pending || S.busy || S.pending.busy) return;
   if (S.src.kind === 'pdf') await acceptSheet();
   else await acceptImage();
+  if (S.boundary === 'frame') setBoundary(usualBoundary(), false);
 }
 
 async function acceptSheet() {
@@ -1284,6 +1296,7 @@ async function acceptImage() {
 function reject() {
   if (!S.pending) return;
   clearPending();
+  if (S.boundary === 'frame') setBoundary(usualBoundary(), false);
   status('Отклонено. Пометки на месте, ответ остался в истории.');
 }
 

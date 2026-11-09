@@ -12,12 +12,11 @@
 const V = new URL(import.meta.url).search;   // см. комментарий в app.js
 const { blank } = await import('./marks.js' + V);
 
-export const BOUNDARIES = ['grow', 'mark', 'frame'];
-
 const FEATHER_RATIO = 0.004;
 const GROW_EDGE = 512;       // изменения ищутся на копии такого размера
-const GROW_REACH = 0.3;      // дальше этой доли длинной стороны от пометки не растём
-const GROW_MIN_DIFF = 16;    // нижний порог разницы канала, уровни из 255
+const GROW_REACH = 0.2;      // дальше этой доли длинной стороны от пометки не растём
+const GROW_MIN_DIFF = 18;    // нижний порог разницы яркости, уровни из 255
+const GROW_MIN_TEXTURE = 5;  // нижний порог разницы фактуры (разброса яркости)
 const GROW_CLOSE = 0.02;     // зазубрины уже этой доли длинной стороны закрываются
 const TONE_EDGE = 256;
 
@@ -107,14 +106,61 @@ function dilate(src, w, h, r) {
   return out;
 }
 
+/** Средняя яркость и разброс яркости в окне (2r+1)² через интегральные суммы. */
+function texture(Y, w, h, r) {
+  const W1 = w + 1;
+  const S = new Float64Array(W1 * (h + 1));
+  const Q = new Float64Array(W1 * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let rs = 0;
+    let rq = 0;
+    for (let x = 0; x < w; x++) {
+      const v = Y[y * w + x];
+      rs += v;
+      rq += v * v;
+      S[(y + 1) * W1 + x + 1] = S[y * W1 + x + 1] + rs;
+      Q[(y + 1) * W1 + x + 1] = Q[y * W1 + x + 1] + rq;
+    }
+  }
+  const sd = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r);
+    const y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r);
+      const x1 = Math.min(w, x + r + 1);
+      const a = (y1 - y0) * (x1 - x0);
+      const sum = S[y1 * W1 + x1] - S[y0 * W1 + x1] - S[y1 * W1 + x0] + S[y0 * W1 + x0];
+      const sq = Q[y1 * W1 + x1] - Q[y0 * W1 + x1] - Q[y1 * W1 + x0] + Q[y0 * W1 + x0];
+      sd[y * w + x] = Math.sqrt(Math.max(0, sq / a - (sum / a) ** 2));
+    }
+  }
+  return sd;
+}
+
+/** Порог по шуму: медиана плюс k отклонений по точкам вдали от пометки. */
+function noiseLevel(values, far, farCount, floor, k = 5) {
+  if (farCount < 100) return floor;
+  const scale = 4;   // четверть уровня на ячейку гистограммы
+  const hist = new Uint32Array(1024);
+  for (let p = 0; p < values.length; p++) if (far[p]) hist[Math.min(1023, Math.round(values[p] * scale))]++;
+  const med = median(hist, farCount);
+  const dev = new Uint32Array(1024);
+  for (let v = 0; v < 1024; v++) dev[Math.abs(v - med)] += hist[v];
+  return Math.max(floor, (med + k * median(dev, farCount)) / scale);
+}
+
 /**
  * Граница «по изменениям»: пометка плюс области, где ответ заметно
  * отличается от оригинала и которые смыкаются с пометкой, не дальше
  * GROW_REACH от неё. Дыры внутри заливаются.
  *
- * Порог берётся по шуму ответа вне пометки: модель перерисовывает и
- * нетронутые места (трава, штриховка), и эта разница не должна тянуть
- * границу. Общий сдвиг цвета снимается заранее.
+ * Изменением считается новое по яркости или по фактуре: здание на месте
+ * травы, тень, убранный объект. Смена оттенка при той же яркости и
+ * фактуре изменением не считается: модель перекрашивает и нетронутые
+ * места вокруг правки, и такая перекраска не должна попадать в кадр.
+ * Пороги берутся по шуму ответа вдали от пометки, общий сдвиг яркости и
+ * контраста снимается заранее.
  *
  * Возвращает холст размера оригинала и долю, на которую выросла площадь.
  */
@@ -132,40 +178,50 @@ export function growMask(original, aligned, mask) {
   const Near = pixels(mask, w, h, blur * 3);
 
   const marked = new Uint8Array(n);
+  const far = new Uint8Array(n);
   let markedCount = 0;
+  let farCount = 0;
+  const YA = new Float32Array(n);
+  const YB = new Float32Array(n);
+  for (let p = 0, i = 0; p < n; p++, i += 4) {
+    if (M[i + 3] >= 128) { marked[p] = 1; markedCount++; }
+    if (Near[i + 3] === 0) { far[p] = 1; farCount++; }
+    YA[p] = A[i] * 0.299 + A[i + 1] * 0.587 + A[i + 2] * 0.114;
+    YB[p] = B[i] * 0.299 + B[i + 1] * 0.587 + B[i + 2] * 0.114;
+  }
+
+  // Общий сдвиг яркости и контраста ответа: прямая yA = g·yB + b по точкам
+  // вдали от пометки, явные правки (разница больше 40) не учитываются.
+  let g = 1;
+  let b0 = 0;
+  {
+    let m = 0, sa = 0, sb = 0, sbb = 0, sab = 0;
+    for (let p = 0; p < n; p++) {
+      if (!far[p] || Math.abs(YA[p] - YB[p]) > 40) continue;
+      m++; sa += YA[p]; sb += YB[p]; sbb += YB[p] * YB[p]; sab += YA[p] * YB[p];
+    }
+    if (m > 100) {
+      const vb = sbb / m - (sb / m) ** 2;
+      const gg = vb > 1 ? (sab / m - (sa / m) * (sb / m)) / vb : 1;
+      if (gg > 0.7 && gg < 1.4) { g = gg; b0 = sa / m - g * (sb / m); }
+    }
+  }
+
+  const tr = Math.max(2, Math.round(Math.max(w, h) / 200));
+  const sA = texture(YA, w, h, tr);
+  const sB = texture(YB, w, h, tr);
+  const dY = new Float32Array(n);
+  const dS = new Float32Array(n);
   for (let p = 0; p < n; p++) {
-    if (M[p * 4 + 3] >= 128) { marked[p] = 1; markedCount++; }
+    dY[p] = Math.abs(g * YB[p] + b0 - YA[p]);
+    dS[p] = Math.abs(g * sB[p] - sA[p]);
   }
-
-  // Общий сдвиг цвета по точкам вдали от пометки: медиана разницы по каналу.
-  const shift = [0, 0, 0];
-  const hists = [new Uint32Array(511), new Uint32Array(511), new Uint32Array(511)];
-  let far = 0;
-  for (let p = 0, i = 0; p < n; p++, i += 4) {
-    if (Near[i + 3] > 0) continue;
-    for (let c = 0; c < 3; c++) hists[c][B[i + c] - A[i + c] + 255]++;
-    far++;
-  }
-  if (far > 100) for (let c = 0; c < 3; c++) shift[c] = median(hists[c], far) - 255;
-
-  const d = new Float32Array(n);
-  const noise = new Uint32Array(256);
-  for (let p = 0, i = 0; p < n; p++, i += 4) {
-    const v = (Math.abs(B[i] - shift[0] - A[i]) + Math.abs(B[i + 1] - shift[1] - A[i + 1]) + Math.abs(B[i + 2] - shift[2] - A[i + 2])) / 3;
-    d[p] = v;
-    if (Near[i + 3] === 0) noise[Math.min(255, Math.round(v))]++;
-  }
-  let threshold = GROW_MIN_DIFF;
-  if (far > 100) {
-    const med = median(noise, far);
-    const dev = new Uint32Array(256);
-    for (let v = 0; v < 256; v++) dev[Math.abs(v - med)] += noise[v];
-    threshold = Math.max(GROW_MIN_DIFF, med + 4.5 * median(dev, far));
-  }
+  const tY = noiseLevel(dY, far, farCount, GROW_MIN_DIFF);
+  const tS = noiseLevel(dS, far, farCount, GROW_MIN_TEXTURE);
 
   // Изменённые точки; одиночные отбрасываются: из девяти соседей нужно пять.
   const raw = new Uint8Array(n);
-  for (let p = 0; p < n; p++) raw[p] = d[p] > threshold ? 1 : 0;
+  for (let p = 0; p < n; p++) raw[p] = dY[p] > tY || dS[p] > tS ? 1 : 0;
   const changed = new Uint8Array(n);
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
@@ -174,6 +230,7 @@ export function growMask(original, aligned, mask) {
       changed[p] = s >= 5 ? 1 : 0;
     }
   }
+  const threshold = { luminance: tY, texture: tS };
 
   // Рост от пометки по изменённым точкам, с ограничением расстояния.
   const reach = Math.round(GROW_REACH * Math.max(w, h));
@@ -211,8 +268,11 @@ export function growMask(original, aligned, mask) {
   const gaps = new Uint8Array(n);
   for (let p = 0; p < n; p++) gaps[p] = wide[p] ? 0 : 1;
   const shrunk = dilate(gaps, w, h, r);
-  const inside = new Uint8Array(n);
-  for (let p = 0; p < n; p++) inside[p] = grown[p] || !shrunk[p] ? 1 : 0;
+  // Плюс точка анализа по краю: размытие и отбор одиночных точек съедают
+  // край нового объекта.
+  const closed = new Uint8Array(n);
+  for (let p = 0; p < n; p++) closed[p] = grown[p] || !shrunk[p] ? 1 : 0;
+  const inside = dilate(closed, w, h, 1);
 
   // Дыры внутри выросшей области заливаются: снаружи то, до чего можно
   // дойти от края кадра, не пересекая её.
@@ -252,9 +312,12 @@ export function growMask(original, aligned, mask) {
 }
 
 /**
- * Поправка тона ответа по каналам, c' = g·c + b, по точкам вне границы
- * правки, где ответ и оригинал должны совпадать. Модель часто чуть
- * осветляет или перекрашивает кадр, и без поправки вставка видна пятном.
+ * Поправка яркости и контраста ответа, y' = g·y + b, одна на все каналы.
+ * Модель часто чуть осветляет кадр, и без поправки вставка видна светлым
+ * пятном. Оценка идёт по яркости точек вне границы правки, где ответ и
+ * оригинал должны совпадать, с отбрасыванием выбросов: перекраска оттенка
+ * вокруг правки и явные изменения на оценку не влияют. Оттенок не
+ * правится: по каналам оценку тянет любая перекраска.
  * null, если поправка не нужна или вышла неправдоподобной.
  */
 export function toneOf(original, aligned, region) {
@@ -264,25 +327,38 @@ export function toneOf(original, aligned, region) {
   const A = pixels(original, w, h, 1);
   const B = pixels(aligned, w, h, 1);
   const R = pixels(region, w, h, 3);
-  const tone = [];
-  for (let c = 0; c < 3; c++) {
+  const ya = [];
+  const yb = [];
+  for (let i = 0; i < A.length; i += 4) {
+    if (R[i + 3] > 0) continue;
+    ya.push(A[i] * 0.299 + A[i + 1] * 0.587 + A[i + 2] * 0.114);
+    yb.push(B[i] * 0.299 + B[i + 1] * 0.587 + B[i + 2] * 0.114);
+  }
+  if (ya.length < 200) return null;
+
+  // Два прохода: прямая по всем точкам, затем без точек с остатком больше
+  // трёх медианных отклонений.
+  let g = 1;
+  let b0 = 0;
+  let keep = ya.map(() => true);
+  for (let pass = 0; pass < 2; pass++) {
     let n = 0, sa = 0, sb = 0, sbb = 0, sab = 0;
-    for (let i = 0; i < A.length; i += 4) {
-      if (R[i + 3] > 0) continue;
-      const a = A[i + c];
-      const b = B[i + c];
-      if (Math.abs(a - b) > 60) continue;   // изменённое по делу не учитываем
-      n++; sa += a; sb += b; sbb += b * b; sab += a * b;
+    for (let j = 0; j < ya.length; j++) {
+      if (!keep[j]) continue;
+      n++; sa += ya[j]; sb += yb[j]; sbb += yb[j] * yb[j]; sab += ya[j] * yb[j];
     }
     if (n < 200) return null;
     const vb = sbb / n - (sb / n) ** 2;
-    const g = vb > 1 ? (sab / n - (sa / n) * (sb / n)) / vb : 1;
-    const b0 = sa / n - g * (sb / n);
-    if (g < 0.85 || g > 1.18 || Math.abs(b0) > 30) return null;
-    tone.push([g, b0]);
+    g = vb > 1 ? (sab / n - (sa / n) * (sb / n)) / vb : 1;
+    b0 = sa / n - g * (sb / n);
+    const res = ya.map((a, j) => Math.abs(g * yb[j] + b0 - a));
+    const sorted = res.filter((_, j) => keep[j]).sort((x, y) => x - y);
+    const mad = Math.max(1, sorted[sorted.length >> 1]);
+    keep = res.map((r) => r <= 3 * mad);
   }
-  const idle = tone.every(([g, b0]) => Math.abs(g - 1) < 0.01 && Math.abs(b0) < 1.5);
-  return idle ? null : tone;
+  if (g < 0.85 || g > 1.18 || Math.abs(b0) > 30) return null;
+  if (Math.abs(g - 1) < 0.01 && Math.abs(b0) < 1.5) return null;
+  return [[g, b0], [g, b0], [g, b0]];
 }
 
 function applyTone(canvas, tone) {
