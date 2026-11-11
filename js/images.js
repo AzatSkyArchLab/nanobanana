@@ -141,7 +141,8 @@ export function download(blob, filename) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  // Большой PDF браузер читает из ссылки не сразу: отпускаем её с запасом.
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 export function extFor(type) {

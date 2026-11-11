@@ -1379,14 +1379,32 @@ function outName(name) {
   return name && /\.pdf$/i.test(name) ? name : `${name || 'документ'}.pdf`;
 }
 
+/**
+ * Окно выбора файла годится не везде. Встроенный браузер приложения Claude
+ * (в userAgent есть «Claude/») окно показывает и создаёт пустой файл, а
+ * запись в него запрещает. Там PDF сразу скачивается. Если запись не
+ * удалась в другом браузере, это запоминается, и дальше он тоже скачивает.
+ */
+const LS_NO_PICKER = 'nb.noSavePicker';
+const EMBEDDED = /\bClaude\//.test(navigator.userAgent);
+
+function pickerUsable() {
+  if (!window.showSaveFilePicker || EMBEDDED) return false;
+  try { return localStorage.getItem(LS_NO_PICKER) !== '1'; } catch { return true; }
+}
+
 async function savePdf() {
   const src = S.src;
   if (src?.kind !== 'pdf' || !src.patches.length) return;
   const name = outName(src.name);
   // Окно выбора файла нужно открыть сразу по нажатию: после долгой сборки
-  // браузер уже не считает действие пользовательским и откажет.
-  let handle = null;
-  if (window.showSaveFilePicker) {
+  // браузер уже не считает действие пользовательским и откажет. Запись
+  // открывается сразу за ним: если её не дают, это видно до сборки.
+  let writable = null;
+  let target = '';
+  let refused = '';
+  if (pickerUsable()) {
+    let handle = null;
     try {
       handle = await window.showSaveFilePicker({
         suggestedName: name,
@@ -1394,7 +1412,15 @@ async function savePdf() {
       });
     } catch (e) {
       if (e.name === 'AbortError') { status('Сохранение отменено.'); return; }
-      handle = null;
+    }
+    if (handle) {
+      try {
+        writable = await handle.createWritable();
+        target = handle.name;
+      } catch {
+        try { localStorage.setItem(LS_NO_PICKER, '1'); } catch { /* хранилище недоступно */ }
+        refused = ` Браузер не дал записать в «${handle.name}»: там мог остаться пустой файл, его можно удалить.`;
+      }
     }
   }
   ui.save.disabled = true;
@@ -1403,17 +1429,19 @@ async function savePdf() {
     const bytes = await pdfLib.build(src.bytes, src.doc, src.patches);
     const blob = new Blob([bytes], { type: 'application/pdf' });
     const size = `${(blob.size / 1048576).toFixed(1)} МБ`;
-    if (handle) {
-      const w = await handle.createWritable();
-      await w.write(blob);
-      await w.close();
-      status(`PDF записан в «${handle.name}» · ${src.patches.length} ${app.plural(src.patches.length, ['правка', 'правки', 'правок'])}, ${size}.`);
+    const count = `${src.patches.length} ${app.plural(src.patches.length, ['правка', 'правки', 'правок'])}`;
+    if (writable) {
+      await writable.write(blob);
+      await writable.close();
+      status(`PDF записан в «${target}» · ${count}, ${size}.`);
     } else {
       const fallback = name.replace(/\.pdf$/i, '_nb.pdf');
       download(blob, fallback);
-      status(`PDF скачан как «${fallback}» · ${size}.`);
+      status(`PDF скачан в папку загрузок как «${fallback}» · ${count}, ${size}.${refused}`);
     }
   } catch (e) {
+    // Незакрытая запись не трогает выбранный файл: она пишет во временный.
+    await writable?.abort?.().catch(() => {});
     status(e.message || 'PDF не собрался.', 'error');
   } finally {
     ui.save.disabled = false;
