@@ -316,7 +316,7 @@ details .field { margin-top: 10px; }
 .ed-page-badge { font-size: 11px; color: var(--muted); min-height: 14px; }
 .ed-page.edited .ed-page-badge { color: var(--accent); }
 
-.ed-main { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+.ed-main { display: grid; grid-template-rows: auto auto minmax(0, 1fr); min-width: 0; min-height: 0; }
 .ed-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -328,8 +328,47 @@ details .field { margin-top: 10px; }
 .ed-group { display: flex; gap: 4px; }
 .ed-group button.active { border-color: var(--accent); color: var(--accent); }
 .ed-zoom-val { min-width: 58px; font-variant-numeric: tabular-nums; }
-.ed-size { display: flex; align-items: center; gap: 8px; text-transform: none; letter-spacing: 0; }
-.ed-size input { width: 120px; }
+.ed-sep { width: 1px; align-self: stretch; background: var(--line); }
+
+/* Цвет краски: системный выбор цвета в виде квадратика */
+.ed-colour {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 2px solid var(--line);
+  cursor: pointer;
+}
+.ed-colour input { width: 200%; height: 200%; margin: -50%; padding: 0; border: none; cursor: pointer; }
+
+/* Настройки выбранного инструмента */
+.ed-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+  min-height: 42px;   /* строка с кнопками и строка с ползунками одной высоты */
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+.ed-opt { display: flex; align-items: center; gap: 8px; text-transform: none; letter-spacing: 0; font-size: 12px; }
+.ed-opt[hidden] { display: none; }
+.ed-opt input[type=range] { width: 110px; }
+.ed-opt .counter { min-width: 42px; font-variant-numeric: tabular-nums; }
+/* Подсказка берёт остаток строки и не переносит её: иначе высота строки
+   менялась бы с инструментом, и лист прыгал бы при каждом переключении.
+   Полный текст в title. */
+.ed-opt-hint {
+  flex: 1 1 0;
+  min-width: 120px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .swatches { display: flex; gap: 6px; }
 .swatches button {
@@ -374,6 +413,41 @@ details .field { margin-top: 10px; }
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .8);
   transform: translate(-50%, -50%);
 }
+
+/* Выделение лассо: «бегущие муравьи» в координатах экрана, поэтому
+   толщина и шаг штриха не зависят от масштаба листа. */
+.ed-sel {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.ed-sel path { fill: none; stroke-width: 1.5; }
+.ed-sel .ant-bg { stroke: #fff; }
+.ed-sel .ant-fg { stroke: #000; stroke-dasharray: 5 5; animation: ed-ants .6s linear infinite; }
+.ed-sel .ant-start { fill: #fff; stroke: #000; stroke-width: 1.5; }
+.ed-sel .ant-start.near { fill: var(--accent); }
+@keyframes ed-ants { to { stroke-dashoffset: -10; } }
+
+/* Источник штампа: перекрестие */
+.ed-source {
+  position: absolute;
+  width: 19px;
+  height: 19px;
+  margin: -9px 0 0 -9px;
+  pointer-events: none;
+}
+.ed-source[hidden] { display: none; }
+.ed-source::before, .ed-source::after {
+  content: '';
+  position: absolute;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .85);
+}
+.ed-source::before { left: 9px; top: 0; width: 1px; height: 19px; }
+.ed-source::after { top: 9px; left: 0; width: 19px; height: 1px; }
 .ed-loading {
   position: absolute;
   inset: 0;
@@ -459,6 +533,18 @@ details .field { margin-top: 10px; }
 }
 .seg button + button { border-left: 1px solid var(--line); }
 .seg button.active { background: var(--surface-2); color: var(--accent); }
+
+.ed-paint {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.ed-paint[hidden] { display: none; }
+.ed-paint .hint { margin: 0; }
 
 .ed-actions { display: flex; gap: 8px; }
 .ed-actions .primary { flex: 1; }

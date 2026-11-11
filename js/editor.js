@@ -9,9 +9,12 @@
 // векторный, поэтому фрагмент рисуется в полном разрешении модели и мелкие
 // детали чертежа сохраняются. Кадр подгоняется под
 // пропорции, которые принимает модель; поле за краем листа дополняется белым.
+//
+// Кроме правки моделью лист можно править руками: краска, штамп, пипетка,
+// лассо и заливка выделения (см. «Рисование по листу» и paint.js).
 
 const V = new URL(import.meta.url).search;   // см. комментарий в app.js
-const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db] = await Promise.all([
+const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db, paintLib] = await Promise.all([
   import('./marks.js' + V),
   import('./patch.js' + V),
   import('./align.js' + V),
@@ -19,6 +22,7 @@ const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db] = await Prom
   import('./pdfdoc.js' + V),
   import('./images.js' + V),
   import('./db.js' + V),
+  import('./paint.js' + V),
 ]);
 const { PALETTE, Marks, colour, blank, frameOf, paintAll, paintStroke } = marksLib;
 const {
@@ -27,6 +31,7 @@ const {
 const { estimateAlignment } = alignLib;
 const { buildEditPrompt, describe } = promptLib;
 const { toReference, blobToDataUrl, base64ToBlob, rasterize, isImage, download } = images;
+const { Surface, paintFrame, paintNow, reach, groupOps } = paintLib;
 
 // Ключ меняется вместе со смыслом границ: прежний выбор к новым границам
 // не относится, и по умолчанию снова стоит «Целиком».
@@ -50,6 +55,15 @@ const BASE_CACHE = 4;       // сколько растров листов дер
 const NOTE_EDGE = 1024;     // копия с пометками для модели не крупнее
 const HEAVY_PNG = 0.5 * 1048576; // кадр тяжелее этого уходит в JPEG, если тот заметно легче
 const JPEG_QUALITY = 0.92;
+const PAINT_PX_PER_PT = 6;  // заплатка рисования на листе PDF, около 430 dpi
+const PAINT_MIN_PX_PER_PT = 3; // мазки, которым вместе не хватает этого, ложатся разными заплатками
+const PAINT_STEP = 0.08;    // шаг точек пути мазка в долях диаметра
+const LASSO_CLOSE = 8;      // щелчок ближе к первой вершине замыкает лассо, экранные px
+const LASSO_DOUBLE = 400;   // второй щелчок на том же месте быстрее этого замыкает лассо, мс
+const LS_PAINT = 'nb.paint';
+
+const MARK_TOOLS = ['brush', 'rect', 'erase'];
+const RING_TOOLS = ['brush', 'erase', 'paint', 'stamp'];   // инструменты с кольцом кисти
 
 let app = null;   // связь с остальным приложением, см. init
 let ui = null;
@@ -74,8 +88,20 @@ const S = {
   space: false,
   loading: false,
   refTarget: null,
-  detail: { seq: 0, timer: 0, ctrl: null },
+  detail: { seq: 0, timer: 0, ctrl: null, frame: null },
   thumbs: null,
+  paintColour: '#000000',
+  // Штамп по умолчанию почти жёсткий: мягкий край на чертеже тянет за
+  // собой бледные копии линий вокруг мазка.
+  opts: { paint: { hard: 1, alpha: 1 }, stamp: { hard: 0.8, alpha: 1 } },
+  aligned: true,
+  source: null,     // источник штампа: { page, at: [x, y] }
+  offset: null,     // сдвиг выровненного штампа, его задаёт первый мазок
+  lasso: null,      // лассо в работе: { points, add, last: { t, p } }
+  hover: null,      // точка мыши на сцене
+  surf: { base: null, detail: null },   // холсты, по которым идёт мазок, см. paint.js
+  closeArmed: 0,
+  escAt: 0,
 };
 
 const cards = new Map();   // цвет -> карточка области текущего листа
@@ -89,6 +115,9 @@ function pageState(w, h) {
     w, h, k: SHEET_EDGE / Math.max(w, h),
     marks: new Marks(w, h), regions: new Map(), general: '',
     base: null, baseK: 1, baseToken: 0,
+    ops: [],        // мазки рисования, которые ещё не приняты
+    sel: null,      // выделение лассо: { polys: [[[x, y], …], …] }
+    history: [],    // шаги для «Отменить»: { t: 'mark' | 'paint' | 'sel' | 'area', … }
   };
 }
 
@@ -124,6 +153,11 @@ export function init(context) {
     rect: $('ed-rect'), cursor: $('ed-cursor'), loading: $('ed-loading'),
     tools: $('ed-tools'), colors: $('ed-colors'), size: $('ed-size'), sizeVal: $('ed-size-val'),
     undo: $('ed-undo'), clear: $('ed-clear'),
+    options: $('ed-options'), optHint: $('ed-opt-hint'),
+    hard: $('ed-hard'), hardVal: $('ed-hard-val'), alpha: $('ed-alpha'), alphaVal: $('ed-alpha-val'),
+    aligned: $('ed-aligned'), fill: $('ed-fill'), toArea: $('ed-to-area'), deselect: $('ed-deselect'),
+    paintColour: $('ed-paint-colour'), sel: $('ed-sel'), source: $('ed-source'),
+    paint: $('ed-paint'), paintInfo: $('ed-paint-info'), paintAccept: $('ed-paint-accept'), paintCancel: $('ed-paint-cancel'),
     zoomIn: $('ed-zoom-in'), zoomOut: $('ed-zoom-out'), zoomVal: $('ed-zoom-val'),
     title: $('ed-title'), sub: $('ed-sub'), close: $('ed-close'),
     model: $('ed-model'), resolution: $('ed-resolution'),
@@ -135,6 +169,14 @@ export function init(context) {
     status: $('ed-status'), doc: $('ed-doc'), docInfo: $('ed-doc-info'), save: $('ed-save'), revert: $('ed-revert'),
     refInput: $('ed-ref-input'),
   };
+  // Рисование читает пиксели листа на каждом мазке: холсты, которые оно
+  // читает, держатся в памяти процессора. Флаг ставится при первом
+  // обращении к холсту.
+  ui.base.getContext('2d', { willReadFrequently: true });
+  ui.detail.getContext('2d', { willReadFrequently: true });
+  loadPaintPrefs();
+  ui.paintColour.value = S.paintColour;
+  ui.aligned.checked = S.aligned;
   buildSwatches();
   bindStage();
   bindPanel();
@@ -185,7 +227,17 @@ function reset() {
   S.accepted = null;
   S.draw = null;
   S.pan = null;
+  S.lasso = null;
+  S.source = null;
+  S.offset = null;
+  S.hover = null;
+  S.surf = { base: null, detail: null };
+  S.closeArmed = 0;
+  S.detail.frame = null;
   cards.clear();
+  ui.paint.hidden = true;
+  ui.source.hidden = true;
+  ui.sel.style.display = 'none';
   ui.regions.replaceChildren();
   ui.pages.replaceChildren();
   ui.pages.hidden = true;
@@ -315,6 +367,7 @@ function drawBase(P) {
   ui.base.width = P.base.width;
   ui.base.height = P.base.height;
   ui.base.getContext('2d').drawImage(P.base, 0, 0);
+  S.surf.base = null;   // пиксели растра сменились: поверхность мазка снимет их заново
 }
 
 async function showPage(i) {
@@ -338,13 +391,18 @@ async function showPage(i) {
   // Пока рисовали, переключились дальше или растр устарел и рисуется заново.
   if (S.page !== i || !S.src || !P.base) return;
   drawBase(P);
+  if (P.ops.length) paintNow(ui.base, baseFrame(P), P.ops);
   paintAll(marksCtx(), P.marks, sheetFrame(P));
   ui.general.value = P.general;
+  S.lasso = null;
   fit();
   renderTitle();
   syncRegions();
   updateCount();
   markStrip();
+  paintChanged();
+  renderOptions();
+  renderSource();
   ui.pages.children[i]?.scrollIntoView({ block: 'nearest' });
   renderDocInfo();
   ui.stage.focus({ preventScroll: true });
@@ -370,6 +428,8 @@ async function switchPage(i) {
   if (i === S.page || i < 0 || i >= S.pages.length || S.loading) return;
   if (S.busy) { status('Идёт запрос: дождись ответа или нажми «Остановить».', 'error'); return; }
   if (S.pending) { status('Сначала прими или отклони результат.', 'error'); return; }
+  if (S.draw) return;
+  if (cur().ops.length) { status('На листе непринятое рисование: прими или отмени его, потом переходи.', 'error'); return; }
   cur().general = ui.general.value;
   status('');
   await showPage(i);
@@ -381,6 +441,8 @@ function applyView() {
   const { z, x, y, fit: f } = S.view;
   ui.sheet.style.transform = `translate(${x}px, ${y}px) scale(${z})`;
   ui.zoomVal.textContent = `${Math.round((z / f) * 100)}%`;
+  renderSel();
+  renderSource();
   scheduleDetail();
 }
 
@@ -429,7 +491,12 @@ function bindStage() {
   st.addEventListener('pointermove', onMove);
   st.addEventListener('pointerup', onUp);
   st.addEventListener('pointercancel', onUp);
-  st.addEventListener('pointerleave', () => { ui.cursor.hidden = true; });
+  st.addEventListener('pointerleave', () => {
+    ui.cursor.hidden = true;
+    S.hover = null;
+    if (S.lasso) renderSel();
+    renderSource();
+  });
   st.addEventListener('wheel', onWheel, { passive: false });
   st.addEventListener('auxclick', (e) => e.preventDefault());
   new ResizeObserver(() => {
@@ -459,19 +526,50 @@ function onDown(e) {
   if (S.pending) { status('Сначала прими или отклони результат.', 'error'); return; }
   const P = cur();
   const pt = toSource(p);
-  if (S.tool === 'rect') {
-    S.draw = { kind: 'rect', start: pt, end: pt };
-    showRect();
-    return;
+  switch (S.tool) {
+    case 'rect':
+      S.draw = { kind: 'rect', start: pt, end: pt };
+      showRect();
+      return;
+    case 'lasso':
+      lassoClick(p, pt, e.shiftKey);
+      return;
+    case 'pick':
+      pickAt(pt);
+      S.draw = { kind: 'pick' };
+      return;
+    case 'paint':
+    case 'stamp': {
+      // ⌥ + щелчок: у штампа источник, у краски пипетка.
+      if (e.altKey) {
+        if (S.tool === 'stamp') {
+          setSource(pt);
+        } else {
+          pickAt(pt);
+          S.draw = { kind: 'pick' };
+        }
+        return;
+      }
+      const op = newStroke(pt);
+      if (!op) { status('Сначала задай источник штампа: ⌥ + щелчок там, откуда копировать.', 'error'); return; }
+      S.draw = { kind: 'op', op, tail: null };
+      startOp(op);
+      renderSource();
+      return;
+    }
+    default: {
+      const stroke = { kind: 'brush', color: S.color, erase: S.tool === 'erase', size: S.size / P.k, points: [pt] };
+      P.marks.push(stroke);
+      remember({ t: 'mark' });
+      S.draw = { kind: 'brush', stroke };
+      paintStroke(marksCtx(), stroke, sheetFrame(P));
+    }
   }
-  const stroke = { kind: 'brush', color: S.color, erase: S.tool === 'erase', size: S.size / P.k, points: [pt] };
-  P.marks.push(stroke);
-  S.draw = { kind: 'brush', stroke };
-  paintStroke(marksCtx(), stroke, sheetFrame(P));
 }
 
 function onMove(e) {
   const p = stagePoint(e);
+  S.hover = p;
   moveCursor(p);
   if (S.pan) {
     S.view.x = S.pan.x + p[0] - S.pan.start[0];
@@ -479,19 +577,30 @@ function onMove(e) {
     applyView();
     return;
   }
+  if (S.lasso) renderSel();
+  if (S.tool === 'stamp') renderSource();
   if (!S.draw) return;
   const P = cur();
   const pt = toSource(p);
-  if (S.draw.kind === 'rect') {
-    S.draw.end = pt;
-    showRect();
-    return;
+  switch (S.draw.kind) {
+    case 'rect':
+      S.draw.end = pt;
+      showRect();
+      return;
+    case 'pick':
+      pickAt(pt);
+      return;
+    case 'op':
+      extendOp(pt);
+      return;
+    default: {
+      const s = S.draw.stroke;
+      const last = s.points[s.points.length - 1];
+      if (Math.hypot(pt[0] - last[0], pt[1] - last[1]) * P.k < 0.75) return;
+      s.points.push(pt);
+      paintStroke(marksCtx(), s, sheetFrame(P), s.points.length - 1);
+    }
   }
-  const s = S.draw.stroke;
-  const last = s.points[s.points.length - 1];
-  if (Math.hypot(pt[0] - last[0], pt[1] - last[1]) * P.k < 0.75) return;
-  s.points.push(pt);
-  paintStroke(marksCtx(), s, sheetFrame(P), s.points.length - 1);
 }
 
 function onUp() {
@@ -502,7 +611,9 @@ function onUp() {
   }
   if (!S.draw) return;
   const d = S.draw;
+  if (d.kind === 'op') { endOp(); return; }
   S.draw = null;
+  if (d.kind === 'pick') { status(`Цвет краски ${S.paintColour}.`); return; }
   const P = cur();
   if (d.kind === 'rect') {
     ui.rect.hidden = true;
@@ -510,6 +621,7 @@ function onUp() {
     if (Math.abs(bx - ax) * P.k >= 3 && Math.abs(by - ay) * P.k >= 3) {
       const stroke = { kind: 'rect', color: S.color, erase: false, size: 0, points: [d.start, d.end] };
       P.marks.push(stroke);
+      remember({ t: 'mark' });
       paintStroke(marksCtx(), stroke, sheetFrame(P));
     }
   }
@@ -546,7 +658,7 @@ function showRect() {
 }
 
 function moveCursor([x, y]) {
-  const ring = S.tool === 'brush' || S.tool === 'erase';
+  const ring = RING_TOOLS.includes(S.tool);
   if (!ring || S.space || S.pending || !cur()) { ui.cursor.hidden = true; return; }
   const d = S.size * S.view.z;
   Object.assign(ui.cursor.style, { left: `${x}px`, top: `${y}px`, width: `${d}px`, height: `${d}px` });
@@ -559,18 +671,47 @@ function marksChanged() {
   markThumb(S.page);
 }
 
+/** Шаг для «Отменить»: что на листе сделано последним. */
+function remember(tag) {
+  cur().history.push(tag);
+}
+
+/** Шаги этих видов уходят из истории листа: того, что они отменяли, уже нет. */
+function forget(...kinds) {
+  const P = cur();
+  P.history = P.history.filter((t) => !kinds.includes(t.t));
+}
+
+/** Отмена последнего шага листа: пометки, мазка рисования или выделения. */
 function undo() {
   const P = cur();
-  if (!P || S.pending || S.busy) return;
-  P.marks.undo();
-  paintAll(marksCtx(), P.marks, sheetFrame(P));
-  marksChanged();
+  if (!P || S.pending || S.busy || S.loading || S.draw) return;
+  if (S.lasso) { dropVertex(); return; }
+  const tag = P.history.pop();
+  if (!tag) return;
+  if (tag.t === 'paint') {
+    P.ops.pop();
+    redrawBase();
+    paintChanged();
+    return;
+  }
+  if (tag.t === 'sel' || tag.t === 'area') {
+    P.sel = tag.prev;
+    renderSel();
+    renderOptions();
+  }
+  if (tag.t === 'mark' || tag.t === 'area') {
+    for (let i = 0; i < (tag.n || 1); i++) P.marks.undo();
+    paintAll(marksCtx(), P.marks, sheetFrame(P));
+    marksChanged();
+  }
 }
 
 function clearMarks() {
   const P = cur();
   if (!P || S.pending || S.busy) return;
   P.marks.clear();
+  forget('mark', 'area');
   paintAll(marksCtx(), P.marks, sheetFrame(P));
   marksChanged();
 }
@@ -591,15 +732,20 @@ function buildSwatches() {
 
 function selectColour(key) {
   S.color = key;
-  if (S.tool === 'erase' || S.tool === 'hand') setTool('brush');
+  // Цвет области нужен кисти и рамке; с другим инструментом берётся кисть.
+  if (S.tool !== 'brush' && S.tool !== 'rect') setTool('brush');
   for (const b of ui.colors.children) b.classList.toggle('active', b.dataset.key === key);
   syncRegions();
 }
 
 function setTool(tool) {
+  if (S.lasso && tool !== 'lasso') cancelLasso();
   S.tool = tool;
   for (const b of ui.tools.querySelectorAll('[data-tool]')) b.classList.toggle('active', b.dataset.tool === tool);
   ui.stage.dataset.tool = tool;
+  renderOptions();
+  renderSource();
+  if (S.hover) moveCursor(S.hover);
 }
 
 function setSize(px) {
@@ -650,6 +796,515 @@ function renderBoundaryHint() {
       : 'Берётся весь фрагмент, который видела модель, с растушёванными краями.',
   };
   ui.boundaryHint.textContent = `${text[S.boundary]} Границу можно сменить и после ответа, без нового запроса.`;
+}
+
+/* ── Рисование по листу ────────────────────────────────── */
+// Краска, штамп и заливка меняют сам лист. Мазки копятся на листе, пока их
+// не примут или не отменят, и модель видит только принятое. По ходу мыши
+// мазок рисуется на растре листа (и на чётком растре при увеличении);
+// принятое ложится заплаткой: на лист PDF в PAINT_PX_PER_PT, в картинку
+// в её родных пикселях. Пипетка берёт цвет краски с листа. Лассо выделяет
+// многоугольник: краска, штамп и заливка рисуют только внутри него.
+// «Сделать областью» превращает выделение в область для модели.
+
+const baseFrame = (P) => ({ k: P.baseK, x: 0, y: 0, w: ui.base.width, h: ui.base.height });
+
+function baseSurface() {
+  S.surf.base ??= new Surface(ui.base, baseFrame(cur()));
+  return S.surf.base;
+}
+
+const hexToRgb = (hex) => {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+const rgbToHex = (r, g, b) => `#${((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1)}`;
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+/** Точка листа -> точка сцены. */
+function toStage([x, y]) {
+  const P = cur();
+  return [x * P.k * S.view.z + S.view.x, y * P.k * S.view.z + S.view.y];
+}
+
+/** Мазок краски или штампа от точки pt; null, если штампу не задан источник. */
+function newStroke(pt) {
+  const P = cur();
+  const o = S.opts[S.tool];
+  const op = { type: S.tool, points: [pt], size: S.size / P.k, hardness: o.hard, opacity: o.alpha, sel: P.sel };
+  if (S.tool === 'paint') {
+    op.color = hexToRgb(S.paintColour);
+    return op;
+  }
+  if (S.source?.page !== S.page) return null;
+  // Выровненный штамп держит сдвиг первого мазка; без выравнивания каждый
+  // мазок начинает копировать с самого источника.
+  const off = (S.aligned && S.offset) || [S.source.at[0] - pt[0], S.source.at[1] - pt[1]];
+  if (S.aligned) S.offset = off;
+  [op.dx, op.dy] = off;
+  return op;
+}
+
+/** Начало мазка: он сразу ложится в список листа и на экран. */
+function startOp(op) {
+  cancelDetail();   // дорисовка чёткого растра не должна лечь поверх мазка
+  cur().ops.push(op);
+  remember({ t: 'paint' });
+  const base = baseSurface();
+  base.begin(op);
+  S.surf.detail = null;
+  if (!ui.detail.hidden && S.detail.frame) {
+    S.surf.detail = new Surface(ui.detail, S.detail.frame, base);
+    S.surf.detail.begin(op);
+  }
+}
+
+function addPoint(op, pt) {
+  op.points.push(pt);
+  const from = op.points.length - 1;
+  S.surf.base.extend(from);
+  S.surf.detail?.extend(from);
+}
+
+function extendOp(pt) {
+  const d = S.draw;
+  const last = d.op.points[d.op.points.length - 1];
+  // Шаг пути растёт с кистью: путь большой кисти не нужно дробить мельче.
+  const step = Math.max(0.75, S.size * PAINT_STEP);
+  if (Math.hypot(pt[0] - last[0], pt[1] - last[1]) * cur().k < step) {
+    d.tail = pt;
+    return;
+  }
+  d.tail = null;
+  addPoint(d.op, pt);
+  renderSource();
+}
+
+function endOp() {
+  const { op, tail } = S.draw;
+  S.draw = null;
+  if (tail) addPoint(op, tail);
+  finishOp();
+}
+
+function finishOp() {
+  S.surf.base.end();
+  S.surf.detail?.end();
+  S.surf.detail = null;
+  S.closeArmed = 0;
+  paintChanged();
+  renderSource();
+  scheduleDetail();
+}
+
+/** Растр листа заново: чистый лист и мазки поверх (после отмены мазка). */
+function redrawBase() {
+  const P = cur();
+  drawBase(P);
+  if (P.ops.length) paintNow(ui.base, baseFrame(P), P.ops);
+  cancelDetail();
+  ui.detail.hidden = true;
+  scheduleDetail();
+}
+
+function paintChanged() {
+  const P = cur();
+  const n = P?.ops.length || 0;
+  ui.paint.hidden = !n;
+  if (n) {
+    const pdf = S.src.kind === 'pdf';
+    const what = `${n} ${app.plural(n, ['мазок', 'мазка', 'мазков'])}`;
+    ui.paintInfo.textContent = pdf
+      ? `Рисование на листе: ${what}. Модель видит лист без него, пока оно не принято. Принятое ложится на лист заплаткой и сохраняется в документе.`
+      : `Рисование: ${what}. Модель видит картинку без него, пока оно не принято. Принятое станет исходником и сохранится в истории.`;
+    ui.paintAccept.textContent = pdf ? 'Принять в лист' : 'Принять';
+  }
+  markThumb(S.page);
+}
+
+function describePaint(ops) {
+  const count = (type) => ops.filter((o) => o.type === type).length;
+  const parts = [['краска', count('paint')], ['штамп', count('stamp')], ['заливка', count('fill')]]
+    .filter(([, n]) => n)
+    .map(([name, n]) => `${name} (${n})`);
+  return `Рисование в редакторе: ${parts.join(', ')}.`;
+}
+
+async function acceptPaint() {
+  const P = cur();
+  if (!P?.ops.length || S.busy || S.pending || S.loading || S.draw) return;
+  const pdf = S.src.kind === 'pdf';
+  setLoading(true, pdf ? 'Кладу рисование на лист…' : 'Принимаю рисование…');
+  try {
+    if (pdf) await acceptPaintSheet(P);
+    else await acceptPaintImage(P);
+  } catch (e) {
+    status(e.message || 'Рисование не принялось.', 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+/**
+ * Рисование на лист PDF. Мазки, близкие друг к другу, ложатся одной
+ * заплаткой; если вместе они раскиданы по листу шире, чем помещается в
+ * COMPOSE_MAX при PAINT_MIN_PX_PER_PT, заплаток несколько. Заплатка
+ * непрозрачна только там, где прошли мазки: остальной лист остаётся
+ * векторным.
+ */
+async function acceptPaintSheet(P) {
+  const src = S.src;
+  const page = S.page;
+  const added = [];
+  for (const g of groupOps(P.ops, COMPOSE_MAX / PAINT_MIN_PX_PER_PT)) {
+    const x0 = Math.max(0, g.box[0]);
+    const y0 = Math.max(0, g.box[1]);
+    const x1 = Math.min(P.w, g.box[2]);
+    const y1 = Math.min(P.h, g.box[3]);
+    if (x1 <= x0 || y1 <= y0) continue;
+    const k = Math.min(PAINT_PX_PER_PT, COMPOSE_MAX / Math.max(x1 - x0, y1 - y0));
+    const f = frameOf(k, x0, y0, (x1 - x0) * k, (y1 - y0) * k);
+    // Заплатки прошлых групп уже в списке листа: группа видит их так же,
+    // как видела на экране.
+    const canvas = await src.doc.render(page, f, patchesOf(page));
+    const outside = (frame) => src.doc.render(page, frame, patchesOf(page));
+    await paintFrame(canvas, f, g.ops, { outside, onlyTouched: true });
+    const o = opaqueBox(canvas);
+    if (!o) continue;
+    const patch = {
+      id: rid(), doc: src.meta.id, page,
+      x: f.x + o[0] / k, y: f.y + o[1] / k, w: o[2] / k, h: o[3] / k,
+      full: false, blob: await toPng(cut(canvas, o)), ts: Date.now(), record: null,
+    };
+    src.patches.push(patch);
+    added.push(patch);
+  }
+  src.meta.count = src.patches.length;
+  src.meta.ts = Date.now();
+  let unsaved = '';
+  for (const patch of added) {
+    try {
+      await db.sheets.addPatch(src.meta, patch);
+    } catch (e) {
+      unsaved = ` В браузер не записалось (${e.message || e.name}): сохрани PDF до закрытия страницы.`;
+    }
+  }
+
+  // Растр листа дорисовывается заплатками, как при приёме правки модели.
+  if (P.base) {
+    const ctx = P.base.getContext('2d');
+    for (const patch of added) {
+      const bmp = await createImageBitmap(patch.blob);
+      ctx.drawImage(bmp, patch.x * P.baseK, patch.y * P.baseK, patch.w * P.baseK, patch.h * P.baseK);
+      bmp.close?.();
+    }
+  }
+  const n = P.ops.length;
+  P.ops = [];
+  forget('paint');
+  redrawBase();
+  paintChanged();
+  renderThumb(page);
+  renderDocInfo();
+  app.onSheetsChanged();
+  status(`Рисование легло на лист ${page + 1}: ${n} ${app.plural(n, ['мазок', 'мазка', 'мазков'])}. Принятых правок в документе: ${src.patches.length}. Когда закончишь, сохрани PDF.${unsaved}`, unsaved ? 'error' : '');
+}
+
+/** Рисование в картинку: в её родных пикселях, новая картинка идёт в историю. */
+async function acceptPaintImage(P) {
+  const image = blank(P.w, P.h);
+  image.getContext('2d', { willReadFrequently: true }).drawImage(S.src.image, 0, 0);
+  paintNow(image, frameOf(1, 0, 0, P.w, P.h), P.ops);
+  const now = Date.now();
+  const record = {
+    id: `${now}-${Math.random().toString(36).slice(2, 8)}`,
+    ts: now,
+    model: 'paint',
+    modelName: 'Рисование',
+    prompt: describePaint(P.ops),
+    kind: 'paint',
+    cost: 0,
+    seconds: 0,
+    outType: 'image/png',
+    out: await toPng(image),
+    refs: [],
+  };
+  await app.saveRecord(record);
+  S.src.image = image;
+  P.base = image;
+  S.accepted = record.id;
+  P.ops = [];
+  forget('paint');
+  redrawBase();
+  paintChanged();
+  status('Рисование принято: картинка обновлена и сохранена в истории. Можно рисовать и править дальше.');
+}
+
+function cancelPaint() {
+  const P = cur();
+  if (!P?.ops.length || S.loading || S.draw) return;
+  P.ops = [];
+  forget('paint');
+  redrawBase();
+  paintChanged();
+  status('Рисование отменено.');
+}
+
+/* Пипетка */
+
+/** Цвет листа в точке pt в цвет краски: с чёткого растра, если он под точкой. */
+function pickAt([x, y]) {
+  const P = cur();
+  let canvas = ui.base;
+  let px = Math.floor(x * P.baseK);
+  let py = Math.floor(y * P.baseK);
+  const d = S.detail.frame;
+  if (!ui.detail.hidden && d) {
+    const dx = Math.floor((x - d.x) * d.k);
+    const dy = Math.floor((y - d.y) * d.k);
+    if (dx >= 0 && dy >= 0 && dx < d.w && dy < d.h) {
+      canvas = ui.detail;
+      px = dx;
+      py = dy;
+    }
+  }
+  if (px < 0 || py < 0 || px >= canvas.width || py >= canvas.height) return;
+  const [r, g, b] = canvas.getContext('2d', { willReadFrequently: true }).getImageData(px, py, 1, 1).data;
+  setPaintColour(rgbToHex(r, g, b));
+}
+
+function setPaintColour(hex) {
+  S.paintColour = hex;
+  ui.paintColour.value = hex;
+  savePaintPrefs();
+}
+
+/* Штамп */
+
+function setSource(pt) {
+  const P = cur();
+  if (pt[0] < 0 || pt[1] < 0 || pt[0] > P.w || pt[1] > P.h) {
+    status('Источник штампа ставится на листе.', 'error');
+    return;
+  }
+  S.source = { page: S.page, at: pt };
+  S.offset = null;
+  renderSource();
+  renderOptions();
+  status('Источник штампа задан. Теперь рисуй там, куда копировать.');
+}
+
+/**
+ * Перекрестие источника штампа. Пока ведут мазок или когда сдвиг уже
+ * задан, оно идёт за кистью; иначе стоит в самом источнике.
+ */
+function renderSource() {
+  const P = cur();
+  if (!P || S.tool !== 'stamp' || S.source?.page !== S.page || S.pending) {
+    ui.source.hidden = true;
+    return;
+  }
+  let at = S.source.at;
+  const op = S.draw?.kind === 'op' ? S.draw.op : null;
+  const off = op ? [op.dx, op.dy] : S.aligned ? S.offset : null;
+  if (off && S.hover) {
+    const [x, y] = toSource(S.hover);
+    at = [x + off[0], y + off[1]];
+  }
+  const [sx, sy] = toStage(at);
+  ui.source.style.left = `${sx}px`;
+  ui.source.style.top = `${sy}px`;
+  ui.source.hidden = false;
+}
+
+/* Лассо и выделение */
+
+/**
+ * Щелчок лассо ставит вершину. Многоугольник замыкают щелчок по первой
+ * вершине, двойной щелчок или Enter. Shift на первом щелчке добавляет
+ * многоугольник к прежнему выделению, иначе новое выделение заменит
+ * прежнее.
+ */
+function lassoClick(p, pt, shift) {
+  const P = cur();
+  const L = S.lasso;
+  const now = performance.now();
+  if (!L) {
+    S.lasso = { points: [pt], add: shift && !!P.sel, last: { t: now, p } };
+    renderSel();
+    return;
+  }
+  const first = toStage(L.points[0]);
+  const near = L.points.length >= 3 && Math.hypot(p[0] - first[0], p[1] - first[1]) <= LASSO_CLOSE;
+  const twice = now - L.last.t < LASSO_DOUBLE && Math.hypot(p[0] - L.last.p[0], p[1] - L.last.p[1]) <= 6;
+  if (near || twice) {
+    closeLasso();
+    return;
+  }
+  L.points.push(pt);
+  L.last = { t: now, p };
+  renderSel();
+}
+
+/** Многоугольник лассо становится выделением. Меньше трёх вершин: выделение снимается. */
+function closeLasso() {
+  const P = cur();
+  const L = S.lasso;
+  if (!L) return;
+  S.lasso = null;
+  const kept = L.add && P.sel ? P.sel.polys : [];
+  setSelection(L.points.length >= 3 ? { polys: [...kept, L.points] } : kept.length ? P.sel : null);
+}
+
+function cancelLasso() {
+  S.lasso = null;
+  renderSel();
+}
+
+function dropVertex() {
+  S.lasso.points.pop();
+  if (!S.lasso.points.length) S.lasso = null;
+  renderSel();
+}
+
+function setSelection(sel) {
+  const P = cur();
+  if (sel !== P.sel) {
+    remember({ t: 'sel', prev: P.sel });
+    P.sel = sel;
+  }
+  renderSel();
+  renderOptions();
+}
+
+function deselect() {
+  if (S.lasso) cancelLasso();
+  if (cur()?.sel && !S.draw) setSelection(null);
+}
+
+/** Заливка выделения цветом краски с непрозрачностью краски. */
+function fillSelection() {
+  const P = cur();
+  if (!P || S.busy || S.pending || S.loading || S.draw) return;
+  if (!P.sel) { status('Сначала выдели область лассо.', 'error'); return; }
+  startOp({
+    type: 'fill', points: [], size: 0, hardness: 1,
+    opacity: S.opts.paint.alpha, color: hexToRgb(S.paintColour), sel: P.sel,
+  });
+  finishOp();
+}
+
+/** Выделение становится областью для модели выбранного цвета. */
+function selectionToArea() {
+  const P = cur();
+  if (!P?.sel || S.busy || S.pending || S.loading || S.draw) return;
+  for (const poly of P.sel.polys) {
+    P.marks.push({ kind: 'poly', color: S.color, erase: false, size: 0, points: poly.map((v) => v.slice()) });
+  }
+  remember({ t: 'area', prev: P.sel, n: P.sel.polys.length });
+  P.sel = null;
+  paintAll(marksCtx(), P.marks, sheetFrame(P));
+  marksChanged();
+  renderSel();
+  renderOptions();
+  status(`Готово: ${colour(S.color).area} область по выделению. Напиши справа, что в ней должно быть.`);
+}
+
+/** Выделение и лассо в работе поверх листа, в координатах сцены. */
+function renderSel() {
+  const P = cur();
+  const [bg, fg, start] = ui.sel.children;
+  const line = (pts, closed) => `M${pts.map((v) => toStage(v).map((n) => n.toFixed(1)).join(' ')).join('L')}${closed ? 'Z' : ''}`;
+  const parts = [];
+  if (P?.sel) for (const poly of P.sel.polys) parts.push(line(poly, true));
+  const L = P ? S.lasso : null;
+  if (L) parts.push(line(S.hover ? [...L.points, toSource(S.hover)] : L.points, false));
+  const d = parts.join(' ');
+  ui.sel.style.display = d ? '' : 'none';
+  bg.setAttribute('d', d);
+  fg.setAttribute('d', d);
+  if (L) {
+    const [x, y] = toStage(L.points[0]);
+    start.setAttribute('cx', x.toFixed(1));
+    start.setAttribute('cy', y.toFixed(1));
+    const near = L.points.length >= 3 && S.hover && Math.hypot(S.hover[0] - x, S.hover[1] - y) <= LASSO_CLOSE;
+    start.classList.toggle('near', !!near);
+    start.style.display = '';
+  } else {
+    start.style.display = 'none';
+  }
+}
+
+/* Настройки инструмента */
+
+const TOOL_HINTS = {
+  brush: 'Закрась, что исправить моделью. Цифры от 1 до 5 переключают области.',
+  rect: 'Протяни рамку: прямоугольная область для модели.',
+  erase: 'Ластик стирает пометки областей.',
+  paint: 'Краска рисует прямо по листу. ⌥ + щелчок берёт цвет с листа.',
+  pick: 'Щелчок по листу берёт цвет для краски.',
+  lasso: 'Щелчки ставят вершины; замыкают двойной щелчок, Enter или первая вершина. Shift добавляет к выделению, Esc отменяет.',
+  hand: 'Рука двигает лист. Пробел включает её из любого инструмента.',
+};
+
+function renderOptions() {
+  const t = S.tool;
+  const P = cur();
+  const show = (key, on) => {
+    for (const el of ui.options.querySelectorAll(`[data-opt="${key}"]`)) el.hidden = !on;
+  };
+  // Кнопки выделения только у лассо: вместе с настройками кисти они не
+  // помещаются в одну строку, и лист прыгал бы при смене инструмента.
+  show('size', RING_TOOLS.includes(t));
+  show('stroke', t === 'paint' || t === 'stamp');
+  show('aligned', t === 'stamp');
+  show('sel', t === 'lasso');
+  show('marks', MARK_TOOLS.includes(t));
+  if (t === 'paint' || t === 'stamp') {
+    const o = S.opts[t];
+    ui.hard.value = String(Math.round(o.hard * 100));
+    ui.hardVal.textContent = `${Math.round(o.hard * 100)} %`;
+    ui.alpha.value = String(Math.round(o.alpha * 100));
+    ui.alphaVal.textContent = `${Math.round(o.alpha * 100)} %`;
+  }
+  ui.fill.disabled = ui.toArea.disabled = ui.deselect.disabled = !P?.sel;
+  let hint = t === 'stamp'
+    ? (S.source && S.source.page === S.page
+      ? 'Рисуй там, куда копировать. ⌥ + щелчок задаёт новый источник.'
+      : 'Сначала ⌥ + щелчок там, откуда копировать, потом рисуй там, куда.')
+    : TOOL_HINTS[t] || '';
+  if (P?.sel && (t === 'paint' || t === 'stamp')) hint = `Мазок идёт только внутри выделения, ⌘D снимает его. ${hint}`;
+  ui.optHint.textContent = hint;
+  ui.optHint.title = hint;
+}
+
+/** Жёсткость или непрозрачность у краски или штампа (у заливки как у краски). */
+function setStroke(key, value) {
+  const o = S.opts[S.tool === 'stamp' ? 'stamp' : 'paint'];
+  o[key] = key === 'alpha' ? clamp(value, 0.05, 1) : clamp(value, 0, 1);
+  renderOptions();
+  savePaintPrefs();
+}
+
+function loadPaintPrefs() {
+  try {
+    const v = JSON.parse(localStorage.getItem(LS_PAINT) || 'null');
+    if (!v) return;
+    if (/^#[0-9a-f]{6}$/i.test(v.colour || '')) S.paintColour = v.colour.toLowerCase();
+    for (const t of ['paint', 'stamp']) {
+      const o = v.opts?.[t];
+      if (o && Number.isFinite(o.hard) && Number.isFinite(o.alpha)) {
+        S.opts[t] = { hard: clamp(o.hard, 0, 1), alpha: clamp(o.alpha, 0.05, 1) };
+      }
+    }
+    if (typeof v.aligned === 'boolean') S.aligned = v.aligned;
+  } catch { /* хранилище недоступно или запись испорчена */ }
+}
+
+function savePaintPrefs() {
+  try {
+    localStorage.setItem(LS_PAINT, JSON.stringify({ colour: S.paintColour, opts: S.opts, aligned: S.aligned }));
+  } catch { /* хранилище недоступно */ }
 }
 
 /* ── Области ───────────────────────────────────────────── */
@@ -961,8 +1616,11 @@ function setBusy(on) {
 
 async function run() {
   if (S.busy || !cur() || S.loading) return;
-  if (S.pending) clearPending();
+  if (S.draw) return;
   const P = cur();
+  if (P.ops.length) { status('Сначала прими рисование или отмени его: модель видит только принятое.', 'error'); return; }
+  if (S.pending) clearPending();
+  if (S.lasso) cancelLasso();
   P.general = ui.general.value;
 
   const used = P.marks.used();
@@ -1325,6 +1983,7 @@ async function acceptSheet() {
   scheduleDetail();
 
   P.marks.clear();
+  forget('mark', 'area');
   clearRegions(P);
   P.general = '';
   ui.general.value = '';
@@ -1377,7 +2036,8 @@ function renderDocInfo() {
 }
 
 async function revert() {
-  if (S.src?.kind !== 'pdf' || S.busy || S.pending || S.loading) return;
+  if (S.src?.kind !== 'pdf' || S.busy || S.pending || S.loading || S.draw) return;
+  if (cur().ops.length) { status('Сначала прими или отмени рисование на листе.', 'error'); return; }
   const src = S.src;
   const mine = src.patches.filter((p) => p.page === S.page);
   if (!mine.length) return;
@@ -1426,6 +2086,7 @@ function pickerUsable() {
 async function savePdf() {
   const src = S.src;
   if (src?.kind !== 'pdf' || !src.patches.length) return;
+  if (cur()?.ops.length) { status('На листе непринятое рисование: прими или отмени его, потом сохраняй PDF.', 'error'); return; }
   const name = outName(src.name);
   // Окно выбора файла нужно открыть сразу по нажатию: после долгой сборки
   // браузер уже не считает действие пользовательским и откажет. Запись
@@ -1545,10 +2206,13 @@ function markThumb(i) {
   b.classList.toggle('active', i === S.page);
   const n = S.src.patches.filter((p) => p.page === i).length;
   const marked = S.pages[i].marks.strokes.length > 0;
+  const painted = S.pages[i].ops.length > 0;
   b.classList.toggle('edited', n > 0);
-  b.querySelector('.ed-page-badge').textContent = n
-    ? `${n} ${app.plural(n, ['правка', 'правки', 'правок'])}`
-    : marked ? 'есть пометки' : '';
+  b.querySelector('.ed-page-badge').textContent = [
+    n ? `${n} ${app.plural(n, ['правка', 'правки', 'правок'])}` : '',
+    painted ? 'рисование не принято' : '',
+    !n && !painted && marked ? 'есть пометки' : '',
+  ].filter(Boolean).join(' · ');
 }
 
 /* ── Чёткий растр при увеличении ───────────────────────── */
@@ -1571,6 +2235,7 @@ function cancelDetail() {
 async function renderDetail() {
   const P = cur();
   if (S.src?.kind !== 'pdf' || !P?.base || S.loading) return;
+  if (S.draw?.kind === 'op') return;   // мазок рисуется на этом растре сам; по его концу растр строится заново
   const dpr = window.devicePixelRatio || 1;
   const kScreen = S.view.z * P.k * dpr;
   if (kScreen <= P.baseK * 1.15) { ui.detail.hidden = true; return; }
@@ -1589,9 +2254,17 @@ async function renderDetail() {
   y0 = Math.max(0, y0 - my);
   x1 = Math.min(P.w, x1 + mx);
   y1 = Math.min(P.h, y1 + my);
+  // Непринятые мазки рисуются поверх. Штамп читает и за краем видимого,
+  // поэтому кадр растёт до источников штампов, которые пишут в видимое.
+  let area = [x0, y0, x1, y1];
+  if (P.ops.length) {
+    const a = reach(area, P.ops);
+    area = [Math.max(0, a[0]), Math.max(0, a[1]), Math.min(P.w, a[2]), Math.min(P.h, a[3])];
+  }
   let k = kScreen;
-  const big = Math.max(x1 - x0, y1 - y0) * k;
+  const big = Math.max(area[2] - area[0], area[3] - area[1]) * k;
   if (big > 4096) k *= 4096 / big;
+  const f = frameOf(k, area[0], area[1], (area[2] - area[0]) * k, (area[3] - area[1]) * k);
 
   S.detail.ctrl?.abort();
   const ctrl = new AbortController();
@@ -1599,17 +2272,31 @@ async function renderDetail() {
   const seq = ++S.detail.seq;
   const page = S.page;
   try {
-    const c = await S.src.doc.render(page, frameOf(k, x0, y0, (x1 - x0) * k, (y1 - y0) * k), patchesOf(page), ctrl.signal);
-    if (seq !== S.detail.seq || page !== S.page) return;
+    let c = await S.src.doc.render(page, f, patchesOf(page), ctrl.signal);
+    if (seq !== S.detail.seq || page !== S.page || S.draw?.kind === 'op') return;
+    let shown = f;
+    if (P.ops.length) {
+      paintNow(c, f, P.ops);
+      // Показывается только видимая часть кадра.
+      const px0 = Math.max(0, Math.floor((x0 - f.x) * k));
+      const py0 = Math.max(0, Math.floor((y0 - f.y) * k));
+      const px1 = Math.min(f.w, Math.ceil((x1 - f.x) * k));
+      const py1 = Math.min(f.h, Math.ceil((y1 - f.y) * k));
+      if (px0 > 0 || py0 > 0 || px1 < f.w || py1 < f.h) {
+        c = cut(c, [px0, py0, px1 - px0, py1 - py0]);
+        shown = { k, x: f.x + px0 / k, y: f.y + py0 / k, w: px1 - px0, h: py1 - py0 };
+      }
+    }
     ui.detail.width = c.width;
     ui.detail.height = c.height;
     ui.detail.getContext('2d').drawImage(c, 0, 0);
     Object.assign(ui.detail.style, {
-      left: `${x0 * P.k}px`,
-      top: `${y0 * P.k}px`,
-      width: `${(x1 - x0) * P.k}px`,
-      height: `${(y1 - y0) * P.k}px`,
+      left: `${shown.x * P.k}px`,
+      top: `${shown.y * P.k}px`,
+      width: `${(shown.w / k) * P.k}px`,
+      height: `${(shown.h / k) * P.k}px`,
     });
+    S.detail.frame = shown;
     ui.detail.hidden = false;
   } catch {
     // Отменено или не отрисовалось: остаётся базовый растр.
@@ -1623,6 +2310,27 @@ function bindPanel() {
   for (const b of ui.frame.querySelectorAll('[data-frame]')) b.addEventListener('click', () => setFrame(b.dataset.frame));
   for (const b of ui.boundary.querySelectorAll('[data-boundary]')) b.addEventListener('click', () => setBoundary(b.dataset.boundary));
   ui.size.addEventListener('input', () => setSize(Number(ui.size.value)));
+  ui.hard.addEventListener('input', () => setStroke('hard', Number(ui.hard.value) / 100));
+  ui.alpha.addEventListener('input', () => setStroke('alpha', Number(ui.alpha.value) / 100));
+  ui.aligned.addEventListener('change', () => {
+    S.aligned = ui.aligned.checked;
+    S.offset = null;
+    savePaintPrefs();
+    renderSource();
+  });
+  ui.paintColour.addEventListener('input', () => setPaintColour(ui.paintColour.value));
+  // Кнопка после нажатия гаснет или прячется, и фокус ушёл бы из диалога
+  // вместе с клавишами: ⌘Z и инструменты перестали бы работать. Фокус
+  // возвращается на лист.
+  const thenStage = (fn) => async () => {
+    await fn();
+    ui.stage.focus({ preventScroll: true });
+  };
+  ui.fill.addEventListener('click', thenStage(fillSelection));
+  ui.toArea.addEventListener('click', thenStage(selectionToArea));
+  ui.deselect.addEventListener('click', thenStage(deselect));
+  ui.paintAccept.addEventListener('click', thenStage(acceptPaint));
+  ui.paintCancel.addEventListener('click', thenStage(cancelPaint));
   ui.undo.addEventListener('click', undo);
   ui.clear.addEventListener('click', clearMarks);
   ui.zoomIn.addEventListener('click', () => zoomAt(1.25, stageCentre()));
@@ -1653,14 +2361,27 @@ function bindPanel() {
     ui.refInput.value = '';
   });
 
+  // Непринятое рисование при закрытии пропало бы молча: первое нажатие ×
+  // предупреждает, второе в течение нескольких секунд закрывает без него.
   ui.close.addEventListener('click', () => {
+    if (cur()?.ops.length && !S.busy && Date.now() - S.closeArmed > 4000) {
+      S.closeArmed = Date.now();
+      status('На листе непринятое рисование: прими или отмени его. Нажми × ещё раз, чтобы закрыть без него.', 'error');
+      return;
+    }
     S.busy?.abort();
     ui.dialog.close();
   });
   ui.dialog.addEventListener('cancel', (e) => {
-    if (!S.busy) return;
-    e.preventDefault();
-    status('Идёт запрос: дождись ответа или нажми «Остановить».', 'error');
+    // Этот Esc уже отменил лассо.
+    if (performance.now() - S.escAt < 300) { e.preventDefault(); return; }
+    if (S.busy) {
+      e.preventDefault();
+      status('Идёт запрос: дождись ответа или нажми «Остановить».', 'error');
+    } else if (cur()?.ops.length) {
+      e.preventDefault();
+      status('На листе непринятое рисование: прими или отмени его, потом закрой.', 'error');
+    }
   });
   ui.dialog.addEventListener('close', onClosed);
 
@@ -1694,18 +2415,36 @@ const typing = (e) => /^(TEXTAREA|INPUT|SELECT)$/.test(e.target.tagName);
 function onKey(e) {
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); run(); return; }
   if (typing(e)) return;
-  if ((e.metaKey || e.ctrlKey) && e.code === 'KeyZ') { e.preventDefault(); undo(); return; }
-  if (e.metaKey || e.ctrlKey || e.altKey) return;
   // По физическим клавишам: так сочетания работают и в русской раскладке.
+  if ((e.metaKey || e.ctrlKey) && e.code === 'KeyZ') { e.preventDefault(); undo(); return; }
+  if ((e.metaKey || e.ctrlKey) && e.code === 'KeyD') { e.preventDefault(); deselect(); return; }
+  if (e.altKey && (e.code === 'Backspace' || e.code === 'Delete')) { e.preventDefault(); fillSelection(); return; }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (S.lasso) {
+    if (e.code === 'Enter' || e.code === 'NumpadEnter') { e.preventDefault(); closeLasso(); return; }
+    if (e.code === 'Escape') { e.preventDefault(); S.escAt = performance.now(); cancelLasso(); return; }
+    if (e.code === 'Backspace' || e.code === 'Delete') { e.preventDefault(); dropVertex(); return; }
+  }
   const digit = /^Digit([1-5])$/.exec(e.code);
   if (digit) { selectColour(PALETTE[Number(digit[1]) - 1].key); return; }
+  const stroke = S.tool === 'paint' || S.tool === 'stamp';
   switch (e.code) {
     case 'KeyB': setTool('brush'); break;
     case 'KeyR': setTool('rect'); break;
     case 'KeyE': setTool('erase'); break;
     case 'KeyH': setTool('hand'); break;
-    case 'BracketLeft': setSize(S.size / 1.25); break;
-    case 'BracketRight': setSize(S.size * 1.25); break;
+    case 'KeyP': setTool('paint'); break;
+    case 'KeyS': setTool('stamp'); break;
+    case 'KeyI': setTool('pick'); break;
+    case 'KeyL': setTool('lasso'); break;
+    case 'BracketLeft':
+      if (e.shiftKey && stroke) setStroke('hard', S.opts[S.tool].hard - 0.25);
+      else setSize(S.size / 1.25);
+      break;
+    case 'BracketRight':
+      if (e.shiftKey && stroke) setStroke('hard', S.opts[S.tool].hard + 0.25);
+      else setSize(S.size * 1.25);
+      break;
     case 'Digit0': fit(); break;
     case 'Equal': case 'NumpadAdd': zoomAt(1.25, stageCentre()); break;
     case 'Minus': case 'NumpadSubtract': zoomAt(0.8, stageCentre()); break;

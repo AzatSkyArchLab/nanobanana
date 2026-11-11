@@ -43,6 +43,13 @@ function trace(ctx, s, f) {
     ctx.fillRect(px(Math.min(ax, bx)), py(Math.min(ay, by)), Math.abs(bx - ax) * f.k, Math.abs(by - ay) * f.k);
     return;
   }
+  if (s.kind === 'poly') {
+    ctx.beginPath();
+    s.points.forEach(([x, y], i) => (i ? ctx.lineTo(px(x), py(y)) : ctx.moveTo(px(x), py(y))));
+    ctx.closePath();
+    ctx.fill();
+    return;
+  }
   const [x0, y0] = s.points[0];
   if (s.points.length === 1) {
     ctx.beginPath();
@@ -69,7 +76,7 @@ export class Marks {
   constructor(width, height) {
     this.width = width;     // размер источника в его единицах
     this.height = height;
-    this.strokes = [];      // { kind: 'brush' | 'rect', color, erase, size, points: [[x, y], …] }
+    this.strokes = [];      // { kind: 'brush' | 'rect' | 'poly', color, erase, size, points: [[x, y], …] }
   }
 
   push(stroke) { this.strokes.push(stroke); }

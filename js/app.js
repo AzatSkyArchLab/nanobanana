@@ -639,7 +639,9 @@ function renderHistory() {
       : rec.kind === 'sheet' ? ` · лист ${rec.page}`
       : rec.kind === 'brush' ? ' · кисть'
       : rec.refs.length ? ` · ${rec.refs.length} реф.` : '';
-    small.textContent = `${when} · ${money(rec.cost)}${tail}${rec.unsaved ? ' · не сохранено' : ''}`;
+    // Рисование руками в редакторе ничего не стоит: цена ему не нужна.
+    const what = rec.kind === 'paint' ? 'рисование' : `${money(rec.cost)}${tail}`;
+    small.textContent = `${when} · ${what}${rec.unsaved ? ' · не сохранено' : ''}`;
     cap.append(p, small);
 
     card.append(img, cap);
@@ -672,14 +674,19 @@ function openViewer(id) {
   el.viewerImg.src = urlIn(state.viewerUrls, rec.out);
   el.viewerPrompt.textContent = rec.prompt;
 
-  const rows = [
-    ['Модель', shortName(rec.modelName)],
-    ...(rec.kind === 'sheet' ? [['PDF', `${rec.doc}, лист ${rec.page}`]] : []),
-    ['Формат', [rec.resolution, rec.aspect].filter(Boolean).join(' · ') || '—'],
-    ['Стоимость', money(rec.cost)],
-    ['Время', `${rec.seconds} с`],
-    ['Дата', new Date(rec.ts).toLocaleString('ru-RU')],
-  ];
+  const rows = rec.kind === 'paint'
+    ? [
+      ['Правка', 'рисование в редакторе'],
+      ['Дата', new Date(rec.ts).toLocaleString('ru-RU')],
+    ]
+    : [
+      ['Модель', shortName(rec.modelName)],
+      ...(rec.kind === 'sheet' ? [['PDF', `${rec.doc}, лист ${rec.page}`]] : []),
+      ['Формат', [rec.resolution, rec.aspect].filter(Boolean).join(' · ') || '—'],
+      ['Стоимость', money(rec.cost)],
+      ['Время', `${rec.seconds} с`],
+      ['Дата', new Date(rec.ts).toLocaleString('ru-RU')],
+    ];
   el.viewerMeta.replaceChildren(...rows.flatMap(([k, v]) => {
     const dt = document.createElement('dt'); dt.textContent = k;
     const dd = document.createElement('dd'); dd.textContent = v;

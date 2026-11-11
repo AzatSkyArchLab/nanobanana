@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nano banana</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍌</text></svg>">
-<link rel="stylesheet" href="styles.css?v=202611111332">
+<link rel="stylesheet" href="styles.css?v=202611111537">
 </head>
 <body>
 
@@ -145,27 +145,61 @@
     <aside class="ed-pages" id="ed-pages" hidden></aside>
 
     <section class="ed-main">
-      <div class="ed-toolbar">
-        <div class="ed-group" id="ed-tools">
-          <button class="ghost small" data-tool="brush" title="Кисть · B">Кисть</button>
-          <button class="ghost small" data-tool="rect" title="Прямоугольная область · R">Рамка</button>
-          <button class="ghost small" data-tool="erase" title="Ластик · E">Ластик</button>
-          <button class="ghost small" data-tool="hand" title="Рука · H, или держи пробел">Рука</button>
+      <div class="ed-toolbar" id="ed-tools">
+        <div class="ed-group" title="Области для модели">
+          <button class="ghost small" data-tool="brush" title="Кисть области для модели · B">Кисть</button>
+          <button class="ghost small" data-tool="rect" title="Рамка области для модели · R">Рамка</button>
+          <button class="ghost small" data-tool="erase" title="Ластик пометок · E">Ластик</button>
         </div>
         <div class="swatches" id="ed-colors"></div>
-        <label class="ed-size" title="Размер кисти · [ и ]">
-          <input type="range" id="ed-size" min="2" max="400" step="1">
-          <span class="counter" id="ed-size-val"></span>
+        <span class="ed-sep" aria-hidden="true"></span>
+        <div class="ed-group" title="Рисование прямо по листу">
+          <button class="ghost small" data-tool="paint" title="Краска: рисует цветом по листу · P">Краска</button>
+          <button class="ghost small" data-tool="stamp" title="Штамп: копирует участок листа кистью · S">Штамп</button>
+          <button class="ghost small" data-tool="pick" title="Пипетка: цвет краски с листа · I">Пипетка</button>
+          <button class="ghost small" data-tool="lasso" title="Лассо: выделение многоугольником · L. Краска, штамп и заливка рисуют только внутри выделения.">Лассо</button>
+        </div>
+        <label class="ed-colour" title="Цвет краски">
+          <input type="color" id="ed-paint-colour" value="#000000">
         </label>
+        <span class="ed-sep" aria-hidden="true"></span>
         <div class="ed-group">
+          <button class="ghost small" data-tool="hand" title="Рука · H, или держи пробел">Рука</button>
           <button class="ghost small" id="ed-undo" title="⌘Z">Отменить</button>
-          <button class="ghost small" id="ed-clear">Стереть всё</button>
         </div>
         <div class="ed-group">
           <button class="ghost small" id="ed-zoom-out" title="Мельче · −">−</button>
           <button class="ghost small ed-zoom-val" id="ed-zoom-val" title="Вписать · 0">100%</button>
           <button class="ghost small" id="ed-zoom-in" title="Крупнее · +">+</button>
         </div>
+      </div>
+
+      <div class="ed-options" id="ed-options">
+        <label class="ed-opt" data-opt="size" title="Размер кисти · [ и ]">
+          Размер
+          <input type="range" id="ed-size" min="2" max="400" step="1">
+          <span class="counter" id="ed-size-val"></span>
+        </label>
+        <label class="ed-opt" data-opt="stroke" title="Жёсткость края кисти · Shift + [ и ]">
+          Жёсткость
+          <input type="range" id="ed-hard" min="0" max="100" step="5">
+          <span class="counter" id="ed-hard-val"></span>
+        </label>
+        <label class="ed-opt" data-opt="stroke" title="Непрозрачность мазка и заливки">
+          Непрозрачность
+          <input type="range" id="ed-alpha" min="5" max="100" step="5">
+          <span class="counter" id="ed-alpha-val"></span>
+        </label>
+        <label class="check ed-opt" data-opt="aligned" title="Источник идёт за кистью от мазка к мазку. Без галочки каждый мазок копирует с исходной точки.">
+          <input type="checkbox" id="ed-aligned" checked> Выровнено
+        </label>
+        <div class="ed-group ed-opt" data-opt="sel">
+          <button class="ghost small" id="ed-fill" title="Залить выделение цветом краски · ⌥⌫">Залить</button>
+          <button class="ghost small" id="ed-to-area" title="Выделение станет областью для модели выбранного цвета">Сделать областью</button>
+          <button class="ghost small" id="ed-deselect" title="⌘D">Снять выделение</button>
+        </div>
+        <button class="ghost small ed-opt" data-opt="marks" id="ed-clear">Стереть пометки</button>
+        <span class="ed-opt-hint" id="ed-opt-hint"></span>
       </div>
 
       <div class="ed-stage" id="ed-stage" tabindex="-1">
@@ -176,6 +210,12 @@
           <canvas id="ed-marks"></canvas>
           <div class="ed-rect" id="ed-rect" hidden></div>
         </div>
+        <svg class="ed-sel" id="ed-sel" aria-hidden="true">
+          <path class="ant-bg"></path>
+          <path class="ant-fg"></path>
+          <circle class="ant-start" r="4"></circle>
+        </svg>
+        <div class="ed-source" id="ed-source" hidden></div>
         <div class="ed-cursor" id="ed-cursor" hidden></div>
         <div class="ed-loading" id="ed-loading" hidden>Загружаю…</div>
         <p class="ed-help">Колесо или два пальца: прокрутка · ⌘ + колесо или щипок: масштаб · пробел + мышь: рука</p>
@@ -189,6 +229,14 @@
           <p class="hint" id="ed-sub"></p>
         </div>
         <button class="ed-close" id="ed-close" aria-label="Закрыть">×</button>
+      </div>
+
+      <div class="ed-paint" id="ed-paint" hidden>
+        <p class="hint" id="ed-paint-info"></p>
+        <div class="ed-actions">
+          <button class="primary" id="ed-paint-accept">Принять</button>
+          <button class="ghost" id="ed-paint-cancel">Отменить рисование</button>
+        </div>
       </div>
 
       <div class="field-row">
@@ -207,7 +255,8 @@
         <div class="ed-regions" id="ed-regions"></div>
         <p class="hint" id="ed-regions-hint">
           Закрась на листе, что исправить: кистью или рамкой, разными цветами для
-          разных правок. Для каждой области напиши, что там должно быть, и при
+          разных правок. Многоугольник удобно обвести лассо и нажать «Сделать
+          областью». Для каждой области напиши, что там должно быть, и при
           желании приложи референс: перетащи картинку на область или вставь ⌘V.
         </p>
       </div>
@@ -267,6 +316,6 @@
   <input type="file" id="ed-ref-input" accept="image/*" multiple hidden>
 </dialog>
 
-<script type="module" src="js/app.js?v=202611111332"></script>
+<script type="module" src="js/app.js?v=202611111537"></script>
 </body>
 </html>
