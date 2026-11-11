@@ -28,10 +28,11 @@ const { estimateAlignment } = alignLib;
 const { buildEditPrompt, describe } = promptLib;
 const { toReference, blobToDataUrl, base64ToBlob, rasterize, isImage, download } = images;
 
-// Ключ сменился вместе со смыслом границ: прежний выбор («по изменениям»
-// или «по пометке») к новым границам не относится.
-const LS_BOUNDARY = 'nb.edge';
-const LS_BOUNDARY_OLD = 'nb.boundary';
+// Ключ меняется вместе со смыслом границ: прежний выбор к новым границам
+// не относится, и по умолчанию снова стоит «Целиком».
+const LS_BOUNDARY = 'nb.edgeMode';
+const LS_BOUNDARY_OLD = ['nb.boundary', 'nb.edge'];
+const BOUNDARIES = ['whole', 'mark', 'fit', 'frame'];
 
 const SHEET_EDGE = 2048;    // экранный размер листа и слой пометок по длинной стороне
 const BASE_EDGE = 3072;     // растр листа PDF для показа
@@ -42,6 +43,7 @@ const THUMB = 132;          // ширина миниатюры листа, CSS p
 const MARK_ALPHA = 0.45;    // заливка пометок в копии для модели
 const QUIET_CHANGE = 4;     // средняя разница внутри маски ниже этого: модель ничего не сделала
 const CONTEXT = 0.6;        // поле вокруг пометок в долях их размера
+const CONTEXT_UP = 1.5;     // поле над пометками у картинки: место под высоту дома
 const MIN_CONTEXT = 0.15;   // фрагмент не меньше этой доли длинной стороны листа
 const MAX_PX_PER_PT = 8;    // фрагмент PDF не увеличиваем сильнее ~576 dpi
 const BASE_CACHE = 4;       // сколько растров листов держать в памяти
@@ -58,7 +60,7 @@ const S = {
   color: PALETTE[0].key,
   size: 48,         // пиксели слоя пометок
   frame: 'whole',
-  boundary: 'fit',  // граница склейки, см. patch.js
+  boundary: 'whole', // граница склейки, см. patch.js
   view: { z: 1, x: 0, y: 0, fit: 1 },
   busy: null,       // AbortController текущего запроса
   pending: null,    // результат, ждущий решения: { base, view, record }
@@ -135,19 +137,20 @@ export function init(context) {
   bindPanel();
   setSize(S.size);
   setTool('brush');
-  try { localStorage.removeItem(LS_BOUNDARY_OLD); } catch { /* хранилище недоступно */ }
+  try { for (const key of LS_BOUNDARY_OLD) localStorage.removeItem(key); } catch { /* хранилище недоступно */ }
   setBoundary(usualBoundary(), false);
 }
 
 /**
- * Обычная граница: последняя выбранная из «Вписать» и «По области».
- * «Весь кадр» решение на одну правку и не запоминается: иначе следующая
- * правка молча взяла бы весь ответ модели вместе с перекраской вокруг.
+ * Обычная граница: последняя выбранная из «Целиком», «По области» и
+ * «Вписать». «Весь кадр» решение на одну правку и не запоминается: иначе
+ * следующая правка молча взяла бы весь ответ модели вместе с перекраской
+ * вокруг.
  */
 function usualBoundary() {
   let saved = null;
   try { saved = localStorage.getItem(LS_BOUNDARY); } catch { /* хранилище недоступно */ }
-  return saved === 'mark' ? 'mark' : 'fit';
+  return BOUNDARIES.includes(saved) && saved !== 'frame' ? saved : 'whole';
 }
 
 export const isOpen = () => !!ui?.dialog.open;
@@ -636,8 +639,9 @@ async function setBoundary(mode, refresh = true) {
 function renderBoundaryHint() {
   const pdf = S.src?.kind === 'pdf';
   const text = {
-    fit: 'Правка остаётся внутри нарисованной области. Если модель нарисовала объект крупнее области или со сдвигом, он уменьшается и сдвигается так, чтобы войти в неё целиком. За краем области пиксели не меняются.',
+    whole: 'Берётся область и объект, который модель в неё поставила, целиком и в масштабе ответа. Если дом выше или шире закрашенного, он выходит за край, но за краем меняются только точки самого дома и его тени: земля, дороги и соседние дома остаются как были.',
     mark: 'Ответ вырезается строго по нарисованной области: объект, который модель нарисовала крупнее, обрезается по её краю. За краем области пиксели не меняются.',
+    fit: 'Объект, который модель нарисовала крупнее области или со сдвигом, уменьшается и сдвигается, чтобы войти в неё целиком. Масштаб объекта при этом расходится с соседями. За краем области пиксели не меняются.',
     frame: S.frame === 'whole'
       ? (pdf ? 'Берётся весь ответ модели: лист заменяется целиком.' : 'Берётся весь ответ модели как есть.')
       : 'Берётся весь фрагмент, который видела модель, с растушёванными краями.',
@@ -820,12 +824,18 @@ function settle(start, size, limit) {
   return [Math.min(Math.max(start, 0), limit - size), size];
 }
 
-/** Пометки плюс поле вокруг: модели нужен контекст, совмещению нужна площадь вне маски. */
+/**
+ * Пометки плюс поле вокруг: модели нужен контекст, совмещению нужна
+ * площадь вне маски. У картинки поле сверху больше: на участке обычно
+ * ставят дом, и в кадре он поднимается над закрашенным. Без запаса
+ * сверху модель упирается крышей в край кадра.
+ */
 function around(P, [x0, y0, x1, y1]) {
   const bw = x1 - x0;
   const bh = y1 - y0;
   const m = CONTEXT * Math.max(bw, bh);
-  let box = [x0 - m, y0 - m, bw + 2 * m, bh + 2 * m];
+  const up = S.src.kind === 'pdf' ? m : CONTEXT_UP * Math.max(bw, bh);
+  let box = [x0 - m, y0 - up, bw + 2 * m, bh + m + up];
   const long = Math.max(P.w, P.h);
   const min = S.src.kind === 'pdf'
     ? Math.max(MIN_CONTEXT * long, SEND_EDGE / MAX_PX_PER_PT)
@@ -965,6 +975,7 @@ async function run() {
     const started = Date.now();
     const res = await app.api.generate({
       model: model.id, prompt, references, aspectRatio: job.ratio, resolution, signal: ctrl.signal,
+      onWait: (s) => status(app.api.waitText(s), 'busy'),
     });
     const image = res?.data?.[0];
     if (!image?.b64_json) throw new Error('Ответ без изображения: модель отказалась генерировать.');
@@ -1026,7 +1037,7 @@ async function run() {
   }
 }
 
-const BOUNDARY_NAMES = { fit: '«Вписать»', mark: '«По области»', frame: '«Весь кадр»' };
+const BOUNDARY_NAMES = { whole: '«Целиком»', mark: '«По области»', fit: '«Вписать»', frame: '«Весь кадр»' };
 
 function describeFit(fit) {
   if (!fit) return '';
@@ -1039,15 +1050,18 @@ function describeFit(fit) {
 function describeView(v) {
   const parts = [];
   const plan = v.plan;
-  if (v.boundary === 'fit' && v.fitted.length) {
+  const spill = plan?.spill || 0;
+  if (v.boundary === 'whole' && spill >= 0.05) {
+    parts.push(`объект взят целиком в масштабе ответа, ${Math.round(spill * 100)} % его площади за краем области`);
+  } else if (v.boundary === 'fit' && v.fitted.length) {
     const s = Math.min(...v.fitted.map((f) => f.s));
     parts.push(s < 0.995
       ? `модель нарисовала объект крупнее области: он уменьшен до ${Math.round(s * 100)} % и вписан в неё`
       : 'модель сдвинула объект за край области: он перенесён внутрь');
-  } else if (v.boundary === 'mark' && plan?.fits) {
-    parts.push('модель нарисовала объект крупнее области, по краю он обрезан: «Вписать» уменьшит его целиком');
+  } else if (v.boundary === 'mark' && spill >= 0.05) {
+    parts.push('модель нарисовала объект крупнее области, по краю он обрезан: «Целиком» возьмёт его полностью');
   }
-  if (plan?.tooBig && v.boundary !== 'frame') {
+  if (plan?.tooBig && v.boundary === 'fit') {
     parts.push('объект модели слишком велик для области и обрезан по её краю: увеличь область или попроси объект меньше');
   }
   if (v.tone) parts.push('тон подогнан под оригинал');
@@ -1124,7 +1138,7 @@ async function view(P, b, boundary) {
   } else {
     // Объект и его вписывание ищутся один раз на ответ.
     if (!b.plan) b.plan = fitPlan(b.original, b.aligned, b.mask);
-    ({ layers, fitted, busy } = layersFor(b.mask, b.plan, boundary === 'fit'));
+    ({ layers, fitted, busy } = layersFor(b.mask, b.plan, boundary));
   }
   // Тон считается там, где модель не должна была ничего менять.
   const tone = toneOf(b.original, b.aligned, busy);

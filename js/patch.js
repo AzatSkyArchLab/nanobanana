@@ -2,21 +2,26 @@
 //
 // Модель перерисовывает кадр целиком. Ответ совмещается с оригиналом
 // (align.js), подгоняется к нему по тону и кладётся поверх по одной из
-// трёх границ:
-//   fit:   правка остаётся внутри нарисованной области; объект, который
-//          модель нарисовала крупнее области или со сдвигом, уменьшается
-//          и сдвигается так, чтобы войти в неё целиком;
+// четырёх границ:
+//   whole: нарисованная область плюс объект, который модель поставила в неё,
+//          целиком и в масштабе ответа. За краем области меняются только
+//          точки самого объекта: дом на участке поднимается над ним, и его
+//          верх в кадре лежит за закрашенным;
+//   fit:   объект, который модель нарисовала крупнее области или со сдвигом,
+//          уменьшается и сдвигается так, чтобы войти в неё целиком;
 //   mark:  строго закрашенное, объект за краем области обрезается;
 //   frame: весь ответ модели в кадре.
 // За границей остаются пиксели оригинала. Шов растушёвывается внутрь
-// области: за её краем альфа ровно ноль.
+// границы: за её краем альфа ровно ноль.
 
 const V = new URL(import.meta.url).search;   // см. комментарий в app.js
 const { blank } = await import('./marks.js' + V);
 
 const FEATHER_RATIO = 0.004;
 const FIT_EDGE = 512;         // объект ищется на копии такого размера
-const FIT_REACH = 0.35;       // объект ищется не дальше этой доли длинной стороны кадра от области
+const FIT_REACH = 0.6;        // объект ищется не дальше этой доли длинной стороны кадра от области
+const FIT_REACH_AREA = 3;     // и не дальше трёх размеров самой области: высокий дом над участком
+const FIT_STRONG = 2;         // за краем области изменение должно быть во столько раз выше шума
 const FIT_MIN_DIFF = 18;      // нижний порог разницы яркости, уровни из 255
 const FIT_MIN_TEXTURE = 5;    // нижний порог разницы фактуры (разброса яркости)
 const FIT_CLOSE = 0.02;       // зазубрины уже этой доли длинной стороны закрываются
@@ -240,17 +245,27 @@ function changeMap(original, aligned, mask) {
   const tS = noiseLevel(dS, far, farCount, FIT_MIN_TEXTURE);
 
   // Изменённые точки; одиночные отбрасываются: из девяти соседей нужно пять.
-  const raw = new Uint8Array(n);
-  for (let p = 0; p < n; p++) raw[p] = dY[p] > tY || dS[p] > tS ? 1 : 0;
-  const changed = new Uint8Array(n);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const p = y * w + x;
-      const s = raw[p - w - 1] + raw[p - w] + raw[p - w + 1] + raw[p - 1] + raw[p] + raw[p + 1] + raw[p + w - 1] + raw[p + w] + raw[p + w + 1];
-      changed[p] = s >= 5 ? 1 : 0;
+  // Сильные: изменение выше шума в FIT_STRONG раз. За краем области объект
+  // собирается только из сильных: новый дом отличается от земли резко, а
+  // перерисованные моделью дорога или газон рядом едва выходят за шум.
+  const majority = (bits) => {
+    const out = new Uint8Array(n);
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const p = y * w + x;
+        const s = bits[p - w - 1] + bits[p - w] + bits[p - w + 1] + bits[p - 1] + bits[p] + bits[p + 1] + bits[p + w - 1] + bits[p + w] + bits[p + w + 1];
+        out[p] = s >= 5 ? 1 : 0;
+      }
     }
+    return out;
+  };
+  const raw = new Uint8Array(n);
+  const rawStrong = new Uint8Array(n);
+  for (let p = 0; p < n; p++) {
+    raw[p] = dY[p] > tY || dS[p] > tS ? 1 : 0;
+    rawStrong[p] = dY[p] > tY * FIT_STRONG || dS[p] > tS * FIT_STRONG ? 1 : 0;
   }
-  return { w, h, kx: w / W, ky: h / H, marked, changed };
+  return { w, h, kx: w / W, ky: h / H, marked, changed: majority(raw), strong: majority(rawStrong) };
 }
 
 /** Связные части маски по восьми соседям: номер части на каждую точку, -1 вне маски. */
@@ -357,12 +372,18 @@ function grownFrom(map, label, id, dist, w, h, reach) {
  * вписывание. Целиком: тело плюс тонкие детали вплотную к нему (столб,
  * карниз, ограждение на крыше); целиком объект переносится в склейку.
  */
-function objectOf(changed, label, id, dist, w, h, reach) {
+function objectOf(changed, strong, label, id, dist, w, h, reach) {
+  // В области и вплотную к ней годится любое изменение, дальше только сильное.
+  const allowed = new Uint8Array(changed.length);
+  for (let p = 0; p < allowed.length; p++) allowed[p] = dist[p] >= 0 && dist[p] <= 1 ? changed[p] : strong[p];
   const r = Math.max(1, Math.round(Math.max(w, h) * FIT_THIN));
-  const thick = dilate(erode(changed, w, h, r), w, h, r);
-  for (let p = 0; p < thick.length; p++) thick[p] &= changed[p];
+  const thick = dilate(erode(allowed, w, h, r), w, h, r);
+  for (let p = 0; p < thick.length; p++) thick[p] &= allowed[p];
   const body = grownFrom(thick, label, id, dist, w, h, reach);
   if (!body.count) return { body, whole: body };
+  // Вплотную к телу годится и слабое изменение: там, где стена дома почти
+  // совпала по цвету с землёй под ней, сильных изменений нет, и без этого
+  // у дома выпадал бы угол.
   const near = dilate(body.mask, w, h, 2 * r + 1);
   for (let p = 0; p < near.length; p++) near[p] &= changed[p] | body.mask[p];
   return { body, whole: grownFrom(near, label, id, dist, w, h, reach) };
@@ -476,7 +497,7 @@ function fitInto(object, target, w, h) {
  * { s, ex, ey } в пикселях кадра (x' = s·x + ex) или null.
  */
 export function fitPlan(original, aligned, mask) {
-  const { w, h, kx, ky, marked, changed } = changeMap(original, aligned, mask);
+  const { w, h, kx, ky, marked, changed, strong } = changeMap(original, aligned, mask);
   const n = w * h;
   const { label, sizes } = labelParts(marked, w, h);
   const long = Math.max(w, h);
@@ -493,9 +514,9 @@ export function fitPlan(original, aligned, mask) {
       if (y < ay0) ay0 = y;
       if (y > ay1) ay1 = y;
     }
-    const reach = Math.max(8, Math.round(Math.min(FIT_REACH * long, Math.max(ax1 - ax0, ay1 - ay0) + 1)));
+    const reach = Math.max(8, Math.round(Math.min(FIT_REACH * long, FIT_REACH_AREA * (Math.max(ax1 - ax0, ay1 - ay0) + 1))));
     const dist = distanceFrom(area, w, h, reach);
-    const { body, whole } = objectOf(changed, label, id, dist, w, h, reach);
+    const { body, whole } = objectOf(changed, strong, label, id, dist, w, h, reach);
     const count = body.count;
     let spilled = 0;
     for (let p = 0; p < n; p++) if (body.mask[p] && dist[p] > 1) spilled++;
@@ -532,21 +553,53 @@ function bitsCanvas(bits, w, h) {
 }
 
 /**
- * Слои заплатки для границ «fit» и «mark». Вписанная часть пометки берёт
- * из ответа только объект, уменьшенный и сдвинутый внутрь части; вокруг
- * него в части остаётся оригинал. Землю вокруг объекта из ответа брать
- * нельзя: после уменьшения она сдвинута против оригинала, и дороги, бордюры
- * и заборы на шве разъезжаются. Остальная пометка берёт ответ как есть.
- * Для «mark» остаётся один слой: вся пометка.
+ * Слои заплатки для границ «whole», «fit» и «mark».
+ *
+ * whole: один слой без преобразования, пометка плюс объекты всех её частей.
+ * Объект за краем пометки собран только из сильных изменений и шире
+ * настоящего на поле анализа, поэтому шов ложится на землю вокруг дома.
+ *
+ * fit: вписанная часть пометки берёт из ответа только объект, уменьшенный
+ * и сдвинутый внутрь части; вокруг него в части остаётся оригинал. Землю
+ * вокруг объекта из ответа брать нельзя: после уменьшения она сдвинута
+ * против оригинала, и дороги, бордюры и заборы на шве разъезжаются.
+ * Остальная пометка берёт ответ как есть.
+ *
+ * mark: один слой, вся пометка.
+ *
  * busy: пометка вместе с объектами на копии анализа, там тон не оценивается.
  */
-export function layersFor(mask, plan, fit) {
+export function layersFor(mask, plan, mode) {
   const W = mask.width;
   const H = mask.height;
   const sigma = Math.max(1, featherPx(W, H) / 2);
   const draw = (ctx, small) => ctx.drawImage(small, 0, 0, W, H);
-  const fitted = fit ? plan.parts.filter((p) => p.fit) : [];
 
+  let busy = mask;
+  let objects = null;
+  if (plan.parts.length) {
+    const bits = new Uint8Array(plan.w * plan.h);
+    const only = new Uint8Array(plan.w * plan.h);
+    for (const part of plan.parts) {
+      for (let p = 0; p < bits.length; p++) {
+        if (part.area[p] || part.object[p]) bits[p] = 1;
+        if (part.object[p]) only[p] = 1;
+      }
+    }
+    busy = bitsCanvas(bits, plan.w, plan.h);
+    objects = bitsCanvas(only, plan.w, plan.h);
+  }
+
+  if (mode === 'whole') {
+    const region = blank(W, H);
+    const r = region.getContext('2d');
+    r.imageSmoothingQuality = 'high';
+    r.drawImage(mask, 0, 0);
+    if (objects) draw(r, objects);
+    return { layers: [{ alpha: softInside(region, sigma) }], busy, fitted: [] };
+  }
+
+  const fitted = mode === 'fit' ? plan.parts.filter((p) => p.fit) : [];
   const rest = blank(W, H);
   const rctx = rest.getContext('2d');
   rctx.imageSmoothingQuality = 'high';
@@ -578,15 +631,6 @@ export function layersFor(mask, plan, fit) {
     layers.push({ alpha: softInside(M, sigma * 2), transform: T });
   }
   layers.unshift({ alpha: softInside(rest, sigma) });
-
-  let busy = mask;
-  if (plan.parts.length) {
-    const bits = new Uint8Array(plan.w * plan.h);
-    for (const part of plan.parts) {
-      for (let p = 0; p < bits.length; p++) if (part.area[p] || part.object[p]) bits[p] = 1;
-    }
-    busy = bitsCanvas(bits, plan.w, plan.h);
-  }
   return {
     layers,
     busy,

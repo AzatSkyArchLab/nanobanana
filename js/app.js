@@ -423,6 +423,7 @@ async function generate() {
     const res = await api.generate({
       model: model.id, prompt, references, aspectRatio, resolution,
       signal: ctrl.signal,
+      onWait: (s) => say(api.waitText(s), 'busy'),
     });
 
     const image = res?.data?.[0];
