@@ -109,7 +109,7 @@ function status(text, kind = '') {
 /**
  * context: api, modelSelect, resolutionSelect, currentModel, maxRefs,
  * aspectValues, resolution, setModel, setResolution, estimate, money,
- * shortName, busyText, plural, saveRecord, refreshCredits, openViewer,
+ * shortName, busyText, cheaperHint, plural, saveRecord, refreshCredits, openViewer,
  * onSheetsChanged.
  */
 export function init(context) {
@@ -1030,7 +1030,7 @@ async function run() {
     }
   } catch (e) {
     if (e.name === 'AbortError' || ctrl.signal.aborted) status('Остановлено.');
-    else status(e.message || 'Не получилось.', 'error');
+    else status(`${e.message || 'Не получилось.'}${e.reason === 'weight_exceeds_budget' ? await app.cheaperHint(model.id) : ''}`, 'error');
   } finally {
     if (S.busy === ctrl) S.busy = null;
     setBusy(false);

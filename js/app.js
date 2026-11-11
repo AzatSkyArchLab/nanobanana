@@ -218,6 +218,34 @@ function estimateCost(modelId, resolution) {
   return null;
 }
 
+/**
+ * Подсказка к отказу 402 weight_exceeds_budget. Перед запуском OpenRouter
+ * резервирует наихудшую цену запроса, потолок выходных токенов по цене
+ * модели, а резерв под один запрос ограничен долей баланса. Поэтому модель
+ * дешевле за токен проходит при меньшем балансе. Ищется самая дешёвая за
+ * токен Nano Banana, если она заметно дешевле текущей.
+ */
+async function cheaperHint(modelId) {
+  const bananas = state.models.filter(isBanana);
+  await Promise.all(bananas.map((m) => loadPricing(m.id)));
+  const perToken = (id) => {
+    const p = state.pricing.get(id);
+    return p && p.unit === 'token' ? Math.min(...Object.values(p.byVariant)) : null;
+  };
+  const mine = perToken(modelId);
+  let best = null;
+  if (mine != null) {
+    for (const m of bananas) {
+      const p = perToken(m.id);
+      if (m.id !== modelId && p != null && p < mine / 1.4 && (!best || p < best.p)) best = { m, p };
+    }
+  }
+  if (!best) return ' Отказ снимает пополнение баланса: резерв под один запрос растёт вместе с ним.';
+  const ratio = mine / best.p;
+  const times = ratio >= 10 ? String(Math.round(ratio)) : String(Math.round(ratio * 10) / 10).replace('.', ',');
+  return ` «${shortName(best.m.name)}» дешевле за токен в ${times} раза, и OpenRouter пропустит её при меньшем балансе: выбери её в списке моделей и повтори. Или пополни баланс.`;
+}
+
 const shortName = (name) => name.replace(/^Google:\s*/, '');
 const currentResolution = () => (el.resolution.disabled ? undefined : el.resolution.value);
 
@@ -475,7 +503,7 @@ async function generate() {
     setTimeout(refreshCredits, 30000);
   } catch (e) {
     if (e.name === 'AbortError') say('Отменено.');
-    else say(e.message || 'Не получилось.', 'error');
+    else say(`${e.message || 'Не получилось.'}${e.reason === 'weight_exceeds_budget' ? await cheaperHint(model.id) : ''}`, 'error');
   } finally {
     state.inflight = null;
     state.drawing = false;
@@ -506,6 +534,7 @@ function editorModule() {
         money,
         shortName,
         busyText,
+        cheaperHint,
         plural,
         saveRecord,
         updateRecord,
