@@ -47,6 +47,9 @@ const CONTEXT_UP = 1.5;     // поле над пометками у карти�
 const MIN_CONTEXT = 0.15;   // фрагмент не меньше этой доли длинной стороны листа
 const MAX_PX_PER_PT = 8;    // фрагмент PDF не увеличиваем сильнее ~576 dpi
 const BASE_CACHE = 4;       // сколько растров листов держать в памяти
+const NOTE_EDGE = 1024;     // копия с пометками для модели не крупнее
+const HEAVY_PNG = 0.5 * 1048576; // кадр тяжелее этого уходит в JPEG, если тот заметно легче
+const JPEG_QUALITY = 0.92;
 
 let app = null;   // связь с остальным приложением, см. init
 let ui = null;
@@ -915,9 +918,36 @@ async function prepare(P, signal) {
 
   const eps = 0.5 / k;
   const wholePage = bx <= eps && by <= eps && bx + bw >= P.w - eps && by + bh >= P.h - eps;
-  // Кодирование PNG идёт вне основного потока: оба кадра параллельно.
-  const [originalBlob, annotatedBlob] = await Promise.all([toPng(original), toPng(annotated)]);
+  // Кодирование идёт вне основного потока: оба кадра параллельно.
+  const [originalBlob, annotatedBlob] = await Promise.all([compact(original), compact(annotated, NOTE_EDGE)]);
   return { box, ratio, send, original, wholePage, originalBlob, annotatedBlob };
+}
+
+/**
+ * Кадр для запроса как можно легче. Рендер или фото в PNG весит 4–6 МБ, и
+ * запрос из двух таких кадров (15 МБ в base64) по слабому каналу уходит
+ * десятки секунд и рвётся («Сеть недоступна»), а OpenRouter оценивает его
+ * наихудшую цену выше и при небольшом балансе отклоняет с 402 («request
+ * fewer images»): на Nano Banana Pro такой запрос из редактора получал
+ * отказ, а лёгкий из основной панели проходил. Поэтому тяжёлый кадр уходит
+ * в JPEG, он в разы легче. Чертёж из линий остаётся PNG: он и так лёгкий,
+ * а JPEG дал бы ореолы у линий. Копия с пометками нужна модели только чтобы
+ * увидеть области, ей хватает maxEdge по длинной стороне.
+ */
+async function compact(canvas, maxEdge = Infinity) {
+  let c = canvas;
+  const long = Math.max(c.width, c.height);
+  if (long > maxEdge) {
+    const s = maxEdge / long;
+    c = blank(canvas.width * s, canvas.height * s);
+    const ctx = c.getContext('2d');
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(canvas, 0, 0, c.width, c.height);
+  }
+  const png = await toPng(c);
+  if (png.size <= HEAVY_PNG) return png;
+  const jpg = await new Promise((res) => c.toBlob(res, 'image/jpeg', JPEG_QUALITY));
+  return jpg && jpg.size < png.size * 0.6 ? jpg : png;
 }
 
 /* ── Запрос ────────────────────────────────────────────── */

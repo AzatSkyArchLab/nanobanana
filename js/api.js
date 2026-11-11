@@ -93,7 +93,7 @@ async function limitText(status, e, explain) {
   } else if (e.limitSource === 'openrouter_key_limit') {
     parts.push('У ключа исчерпан его собственный лимит трат: деньги на счёте есть, но этому ключу их тратить нельзя. Подними лимит ключа на openrouter.ai в разделе Keys или дождись его сброса.');
   } else if (e.reason === 'weight_exceeds_budget') {
-    parts.push('Перед запуском OpenRouter резервирует наихудшую цену запроса: потолок выходных токенов по цене модели. Резерв под один запрос ограничен долей баланса, и при текущем балансе такой резерв не помещается, хотя по факту картинка стоит в разы дешевле.');
+    parts.push('Перед запуском OpenRouter резервирует наихудшую цену запроса: она растёт с ценой модели за токен и с числом и размером картинок в запросе. Резерв под один запрос ограничен долей баланса, и при текущем балансе такой резерв не помещается, хотя по факту картинка стоит в разы дешевле.');
   } else if (e.limitSource === 'openrouter_credits') {
     parts.push('Баланса на счёте OpenRouter не хватает на этот запрос: пополни его.');
   } else {
@@ -109,16 +109,19 @@ async function limitText(status, e, explain) {
 
 async function request(path, { method = 'GET', body, signal, explain = true } = {}) {
   let res;
+  const json = body ? JSON.stringify(body) : undefined;
+  const started = Date.now();
   try {
-    res = await fetch(`${getBase()}${path}`, {
-      method,
-      headers: headers(),
-      body: body ? JSON.stringify(body) : undefined,
-      signal,
-    });
+    res = await fetch(`${getBase()}${path}`, { method, headers: headers(), body: json, signal });
   } catch (e) {
     if (e.name === 'AbortError') throw e;
-    throw new ApiError(0, 'Сеть недоступна или запрос заблокирован браузером.');
+    // Размер и время отличают обрыв тяжёлого запроса на слабом канале от
+    // отсутствия сети.
+    const mb = json ? json.length / 1048576 : 0;
+    const secs = Math.round((Date.now() - started) / 1000);
+    throw new ApiError(0, mb >= 1
+      ? `Соединение с OpenRouter оборвалось через ${secs} с, запрос весил ${mb.toFixed(1)} МБ. Тяжёлый запрос по медленному каналу уходит долго и может оборваться: повтори; если повторяется, уменьши число референсов.`
+      : 'Сеть недоступна или запрос заблокирован браузером.');
   }
 
   const text = await res.text();
