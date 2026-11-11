@@ -4,6 +4,10 @@
 // обязан стоять до запретов: без него модель получает только список того,
 // что менять нельзя, и возвращает исходник нетронутым.
 //
+// Сразу за приказом идёт требование уложить новое целиком в область:
+// иначе модель рисует объект в своём размере, крупнее закрашенного, и
+// склейка вынуждена его уменьшать или резать (patch.js).
+//
 // Порядок картинок в запросе: 1 оригинал, 2 та же картинка с пометками,
 // дальше референсы областей подряд в порядке палитры.
 
@@ -35,7 +39,7 @@ export function buildEditPrompt({ regions, general = '', subject = 'picture' }) 
     if (text) parts.push(text);
     if (r.refs) {
       const images = imageList(next, r.refs);
-      const fitted = "fitted to the region's size, perspective, lighting and style";
+      const fitted = 'scaled to fit inside the region and matched to its perspective, lighting and style';
       refLines.push(`${upper(images)} ${r.refs === 1 ? 'is the reference' : 'are the references'} for the ${r.colour.en} region.`);
       // Без текста приказом становится сам референс.
       parts.push(text
@@ -58,6 +62,10 @@ export function buildEditPrompt({ regions, general = '', subject = 'picture' }) 
     ? `Edit image 1: change ONLY the regions covered by those overlays, applying each instruction to the region whose colour it names. ${orders.map((o) => `${upper(o.colour.en)} region: ${o.order}.`).join(' ')}`
     : `Edit image 1: change ONLY the region covered by the overlay: ${orders[0].order}.`;
 
+  const inside = many
+    ? "Fit each change inside its region: whatever you add must lie entirely within that region's edges, sized to fit, with nothing crossing them."
+    : 'Fit the change inside the region: whatever you add must lie entirely within its edges, sized to fit, with nothing crossing them.';
+
   const extra = clean(general);
 
   return [
@@ -66,6 +74,7 @@ export function buildEditPrompt({ regions, general = '', subject = 'picture' }) 
     scene,
     ...refLines,
     order,
+    inside,
     extra ? `${upper(extra)}.` : '',
     `Keep everything outside the marked ${many ? 'regions' : 'region'} exactly as in image 1: same composition, colors, lighting, textures and details.`,
     subject === 'picture' ? '' : 'Match the graphic style of the sheet: line weights, hatching, lettering and colours.',

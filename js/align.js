@@ -13,7 +13,12 @@
 // Порядок поиска:
 //   1. грубый перебор масштабов и целых сдвигов на 64 px даёт стартовые точки;
 //   2. каждый старт проходит метод Левенберга-Марквардта на 128, 256 и
-//      1024 px, побеждает старт с меньшей невязкой на 1024 px.
+//      1024 px, побеждает старт с меньшей невязкой на последней ступени.
+//      Если последняя ступень заметно грубее кадра, добавляется ступень
+//      в его родном разрешении, но не крупнее 2048 px. На грубой ступени
+//      минимум невязки смещён: на проверке ошибка в углу кадра 437 px
+//      (последняя ступень 256) доходила до 5 px, кадра 1384 px до 6 px,
+//      со ступенью в родном разрешении около 0.6 px и меньше.
 // Масштаб и сдвиг по одной оси связаны: покоординатный спуск застревает
 // в долине между ними, поэтому шаг ищется сразу по всем параметрам.
 //
@@ -23,6 +28,11 @@
 // шириной в пиксель, после размытия провал шире ошибки предыдущей ступени.
 // Яркость и контраст результата подбираются вместе с геометрией: модель
 // может перекрасить кадр, и без этого перекраска тянула бы совмещение.
+//
+// Рядом с маской сравнивать опасно: модель часто рисует объект крупнее
+// области, и его край за маской перекрывает то, по чему идёт совмещение.
+// Поэтому полоса вокруг маски шириной SPILL от её размера тоже не
+// сравнивается, пока за ней остаётся достаточно точек.
 
 const COARSE = 64;
 const LEVELS = [
@@ -32,6 +42,8 @@ const LEVELS = [
 ];
 const SCALES = [0.94, 0.96, 0.98, 1, 1.02, 1.04, 1.06];
 const HUBER = 12;   // порог робастной невязки, уровни серого
+const SPILL = 0.35; // полоса вокруг маски, куда модель дорисовывает объект, в долях длинной стороны маски
+const NATIVE_MAX = 2048; // последняя ступень в родном разрешении кадра, но не крупнее
 
 function gray(source, w, h, blur = 0) {
   const c = document.createElement('canvas');
@@ -98,12 +110,14 @@ function costShift(A, B, wgt, dx, dy, minPixels) {
 }
 
 /** Лучшая точка перебора в центрированных параметрах [sx, sy, dx, dy] (сдвиг в долях кадра). */
-function coarse(original, result, maskCanvas, W, H) {
+function coarse(original, result, maskCanvas, W, H, spill) {
   const k = COARSE / Math.max(W, H);
   const w = Math.max(8, Math.round(W * k));
   const h = Math.max(8, Math.round(H * k));
   const A = gray(original, w, h);
-  const { out: wgt, free } = freeMap(maskCanvas, w, h, 1);
+  let map = freeMap(maskCanvas, w, h, Math.max(1, Math.round(spill * k)));
+  if (map.free < w * h * 0.1) map = freeMap(maskCanvas, w, h, 1);
+  const { out: wgt, free } = map;
   const minPixels = Math.max(16, free * 0.35);
   const range = Math.max(4, Math.round(Math.max(w, h) * 0.12));
 
@@ -183,18 +197,44 @@ function samples(A, wgt, count) {
   return Int32Array.from(out);
 }
 
-function level(original, result, maskCanvas, W, H, { edge, blur, samples: count }) {
+function level(original, result, maskCanvas, W, H, { edge, blur, samples: count }, spill) {
   const k = Math.min(1, edge / Math.max(W, H));
   const w = Math.max(8, Math.round(W * k));
   const h = Math.max(8, Math.round(H * k));
   const A = gray(original, w, h, blur);
   const B = gray(result, w, h, blur);
-  // Вне маски и вне полосы, куда размытие растаскивает правку. Если маска
-  // закрывает почти весь кадр и за полосой ничего не осталось, полоса уже.
+  // Вне маски, вне полосы, куда модель дорисовывает объект, и вне полосы,
+  // куда размытие растаскивает правку. Если за широкой полосой точек мало,
+  // берётся узкая; если маска закрывает почти весь кадр, ещё уже.
   const band = Math.max(1, Math.round(Math.max(w, h) * 0.006)) + Math.ceil(blur * 2);
-  let idx = samples(A, freeMap(maskCanvas, w, h, band).out, count);
+  let idx = samples(A, freeMap(maskCanvas, w, h, band + Math.round(spill * k)).out, count);
+  if (!idx || idx.length < count * 0.3) idx = samples(A, freeMap(maskCanvas, w, h, band).out, count);
   if (!idx) idx = samples(A, freeMap(maskCanvas, w, h, Math.max(1, Math.round(band / 3))).out, count);
   return { A, B, idx };
+}
+
+/** Длинная сторона охвата маски в пикселях кадра. */
+function maskLong(maskCanvas, W, H) {
+  const k = Math.min(1, 256 / Math.max(W, H));
+  const w = Math.max(8, Math.round(W * k));
+  const h = Math.max(8, Math.round(H * k));
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(maskCanvas, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (d[(y * w + x) * 4 + 3] < 8) continue;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+  }
+  return x1 < 0 ? 0 : (Math.max(x1 - x0, y1 - y0) + 1) / k;
 }
 
 /**
@@ -321,8 +361,13 @@ function lm(L, start, iterations = 15) {
  */
 export function estimateAlignment(original, result, maskCanvas, W, H) {
   const identity = { sx: 1, sy: 1, tx: 0, ty: 0, scale: 1, residual: NaN, gain: 1 };
-  const steps = LEVELS.filter((l, i) => i === 0 || l.edge <= Math.max(W, H) * 1.5)
-    .map((l) => level(original, result, maskCanvas, W, H, l))
+  const spill = SPILL * maskLong(maskCanvas, W, H);
+  const long = Math.max(W, H);
+  const plan = LEVELS.filter((l, i) => i === 0 || l.edge <= long * 1.5);
+  const finest = Math.min(long, NATIVE_MAX);
+  if (plan[plan.length - 1].edge < finest * 0.9) plan.push({ edge: finest, blur: 1.5, samples: 12000 });
+  const steps = plan
+    .map((l) => level(original, result, maskCanvas, W, H, l, spill))
     .filter((L) => L.idx);
   if (!steps.length) return identity;   // вне маски сравнивать нечего
   const last = steps[steps.length - 1];
@@ -331,7 +376,7 @@ export function estimateAlignment(original, result, maskCanvas, W, H) {
   // а сравниваются они на самой подробной ступени: на регулярной сетке
   // осей грубая ступень может предпочесть соседний период.
   const starts = [[1, 1, 0, 0]];
-  const c = coarse(original, result, maskCanvas, W, H);
+  const c = coarse(original, result, maskCanvas, W, H, spill);
   if (c) starts.push(c);
   let best = null;
   for (const s of starts) {
