@@ -12,9 +12,11 @@
 //
 // Кроме правки моделью лист можно править руками: краска, штамп, пипетка,
 // лассо и заливка выделения (см. «Рисование по листу» и paint.js).
+// Выделенный фрагмент сохраняется отдельным файлом: PDF, PNG или JPEG
+// (см. «Фрагмент в файл» и fragment.js).
 
 const V = new URL(import.meta.url).search;   // см. комментарий в app.js
-const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db, paintLib] = await Promise.all([
+const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db, paintLib, fragmentLib] = await Promise.all([
   import('./marks.js' + V),
   import('./patch.js' + V),
   import('./align.js' + V),
@@ -23,6 +25,7 @@ const [marksLib, patchLib, alignLib, promptLib, pdfLib, images, db, paintLib] = 
   import('./images.js' + V),
   import('./db.js' + V),
   import('./paint.js' + V),
+  import('./fragment.js' + V),
 ]);
 const { PALETTE, Marks, colour, blank, frameOf, paintAll, paintStroke } = marksLib;
 const {
@@ -31,7 +34,8 @@ const {
 const { estimateAlignment } = alignLib;
 const { buildEditPrompt, describe } = promptLib;
 const { toReference, blobToDataUrl, base64ToBlob, rasterize, isImage, download } = images;
-const { Surface, paintFrame, paintNow, reach, groupOps } = paintLib;
+const { Surface, paintFrame, paintNow, reach, groupOps, selectionBox } = paintLib;
+const { isFrame, clipTo, encode, JPEG_QUALITY: FRAG_JPEG } = fragmentLib;
 
 // Ключ меняется вместе со смыслом границ: прежний выбор к новым границам
 // не относится, и по умолчанию снова стоит «Целиком».
@@ -61,6 +65,11 @@ const PAINT_STEP = 0.08;    // шаг точек пути мазка в доля
 const LASSO_CLOSE = 8;      // щелчок ближе к первой вершине замыкает лассо, экранные px
 const LASSO_DOUBLE = 400;   // второй щелчок на том же месте быстрее этого замыкает лассо, мс
 const LS_PAINT = 'nb.paint';
+const MARQUEE_MIN = 3;      // протяжка выделения короче этого считается щелчком, экранные px
+const FRAG_DPI = [150, 300, 600];
+const FRAG_SIDE = 16384;    // растр фрагмента не длиннее по стороне
+const FRAG_PIXELS = 64 * 1048576; // и не крупнее 64 Мпикс: около 256 МБ памяти на холст
+const LS_FRAG = 'nb.fragment';
 
 const MARK_TOOLS = ['brush', 'rect', 'erase'];
 const RING_TOOLS = ['brush', 'erase', 'paint', 'stamp'];   // инструменты с кольцом кисти
@@ -102,6 +111,8 @@ const S = {
   surf: { base: null, detail: null },   // холсты, по которым идёт мазок, см. paint.js
   closeArmed: 0,
   escAt: 0,
+  // Формат фрагмента у листа PDF и у картинки свой; плотность для растра листа.
+  frag: { pdf: 'pdf', image: 'png', dpi: 300 },
 };
 
 const cards = new Map();   // цвет -> карточка области текущего листа
@@ -116,7 +127,7 @@ function pageState(w, h) {
     marks: new Marks(w, h), regions: new Map(), general: '',
     base: null, baseK: 1, baseToken: 0,
     ops: [],        // мазки рисования, которые ещё не приняты
-    sel: null,      // выделение лассо: { polys: [[[x, y], …], …] }
+    sel: null,      // выделение: { polys: [[[x, y], …], …] }
     history: [],    // шаги для «Отменить»: { t: 'mark' | 'paint' | 'sel' | 'area', … }
   };
 }
@@ -128,6 +139,7 @@ function region(P, key) {
 
 const hasContent = (r) => !!r && (r.text.trim() !== '' || r.refs.length > 0);
 const sheetFrame = (P) => frameOf(P.k, 0, 0, P.w * P.k, P.h * P.k);
+const mm = (pt) => Math.round((pt * 25.4) / 72);
 const marksCtx = () => ui.marks.getContext('2d');
 const patchesOf = (i) => (S.src?.kind === 'pdf' ? S.src.patches.filter((p) => p.page === i) : []);
 
@@ -158,6 +170,8 @@ export function init(context) {
     aligned: $('ed-aligned'), fill: $('ed-fill'), toArea: $('ed-to-area'), deselect: $('ed-deselect'),
     paintColour: $('ed-paint-colour'), sel: $('ed-sel'), source: $('ed-source'),
     paint: $('ed-paint'), paintInfo: $('ed-paint-info'), paintAccept: $('ed-paint-accept'), paintCancel: $('ed-paint-cancel'),
+    measure: $('ed-measure'), frag: $('ed-frag'), fragSize: $('ed-frag-size'), fragFormat: $('ed-frag-format'),
+    fragDpi: $('ed-frag-dpi'), fragInfo: $('ed-frag-info'), fragSave: $('ed-frag-save'),
     zoomIn: $('ed-zoom-in'), zoomOut: $('ed-zoom-out'), zoomVal: $('ed-zoom-val'),
     title: $('ed-title'), sub: $('ed-sub'), close: $('ed-close'),
     model: $('ed-model'), resolution: $('ed-resolution'),
@@ -175,6 +189,7 @@ export function init(context) {
   ui.base.getContext('2d', { willReadFrequently: true });
   ui.detail.getContext('2d', { willReadFrequently: true });
   loadPaintPrefs();
+  loadFragPrefs();
   ui.paintColour.value = S.paintColour;
   ui.aligned.checked = S.aligned;
   buildSwatches();
@@ -236,6 +251,8 @@ function reset() {
   S.detail.frame = null;
   cards.clear();
   ui.paint.hidden = true;
+  ui.frag.hidden = true;
+  ui.measure.hidden = true;
   ui.source.hidden = true;
   ui.sel.style.display = 'none';
   ui.regions.replaceChildren();
@@ -278,8 +295,11 @@ export async function openImage(blob, name = 'картинка') {
     const ctx = image.getContext('2d');
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(bmp, 0, 0, image.width, image.height);
+    // Картинку крупнее IMAGE_EDGE редактор правит уменьшенной копией.
+    // Пока её не правили, фрагмент берётся из исходника в его пикселях.
+    const original = k < 1 ? { blob: raster, w: bmp.width, h: bmp.height } : null;
     bmp.close?.();
-    S.src = { kind: 'image', name, image };
+    S.src = { kind: 'image', name, image, original };
     S.pages = [pageState(image.width, image.height)];
     setFrame('around');
     await showPage(0);
@@ -415,7 +435,6 @@ async function showPage(i) {
 function renderTitle() {
   const P = cur();
   if (S.src.kind === 'pdf') {
-    const mm = (pt) => Math.round(pt * 25.4 / 72);
     ui.title.textContent = S.src.name;
     ui.sub.textContent = `Лист ${S.page + 1} из ${S.pages.length} · ${mm(P.w)} × ${mm(P.h)} мм`;
   } else {
@@ -493,6 +512,7 @@ function bindStage() {
   st.addEventListener('pointercancel', onUp);
   st.addEventListener('pointerleave', () => {
     ui.cursor.hidden = true;
+    ui.stage.classList.remove('over-sel');
     S.hover = null;
     if (S.lasso) renderSel();
     renderSource();
@@ -533,6 +553,9 @@ function onDown(e) {
       return;
     case 'lasso':
       lassoClick(p, pt, e.shiftKey);
+      return;
+    case 'marquee':
+      startMarquee(p, pt, e.shiftKey);
       return;
     case 'pick':
       pickAt(pt);
@@ -579,6 +602,7 @@ function onMove(e) {
   }
   if (S.lasso) renderSel();
   if (S.tool === 'stamp') renderSource();
+  if (S.tool === 'marquee') markOverSel(p);
   if (!S.draw) return;
   const P = cur();
   const pt = toSource(p);
@@ -586,6 +610,10 @@ function onMove(e) {
     case 'rect':
       S.draw.end = pt;
       showRect();
+      return;
+    case 'marquee':
+    case 'selmove':
+      dragSel(p, pt);
       return;
     case 'pick':
       pickAt(pt);
@@ -614,6 +642,7 @@ function onUp() {
   if (d.kind === 'op') { endOp(); return; }
   S.draw = null;
   if (d.kind === 'pick') { status(`Цвет краски ${S.paintColour}.`); return; }
+  if (d.kind === 'marquee' || d.kind === 'selmove') { endSelDrag(d); return; }
   const P = cur();
   if (d.kind === 'rect') {
     ui.rect.hidden = true;
@@ -740,6 +769,7 @@ function selectColour(key) {
 
 function setTool(tool) {
   if (S.lasso && tool !== 'lasso') cancelLasso();
+  ui.stage.classList.remove('over-sel');
   S.tool = tool;
   for (const b of ui.tools.querySelectorAll('[data-tool]')) b.classList.toggle('active', b.dataset.tool === tool);
   ui.stage.dataset.tool = tool;
@@ -804,8 +834,9 @@ function renderBoundaryHint() {
 // мазок рисуется на растре листа (и на чётком растре при увеличении);
 // принятое ложится заплаткой: на лист PDF в PAINT_PX_PER_PT, в картинку
 // в её родных пикселях. Пипетка берёт цвет краски с листа. Лассо выделяет
-// многоугольник: краска, штамп и заливка рисуют только внутри него.
-// «Сделать областью» превращает выделение в область для модели.
+// многоугольник, «Выделение» прямоугольник: краска, штамп и заливка рисуют
+// только внутри выделения. «Сделать областью» превращает выделение в
+// область для модели.
 
 const baseFrame = (P) => ({ k: P.baseK, x: 0, y: 0, w: ui.base.width, h: ui.base.height });
 
@@ -920,6 +951,7 @@ function paintChanged() {
     ui.paintAccept.textContent = pdf ? 'Принять в лист' : 'Принять';
   }
   markThumb(S.page);
+  renderFragment();
 }
 
 function describePaint(ops) {
@@ -1031,6 +1063,7 @@ async function acceptPaintImage(P) {
   };
   await app.saveRecord(record);
   S.src.image = image;
+  S.src.original = null;
   P.base = image;
   S.accepted = record.id;
   P.ops = [];
@@ -1182,6 +1215,133 @@ function deselect() {
   if (cur()?.sel && !S.draw) setSelection(null);
 }
 
+/** ⌘A: выделение на весь лист. */
+function selectAll() {
+  const P = cur();
+  if (!P || S.draw || S.loading || S.pending) return;
+  if (S.lasso) cancelLasso();
+  setSelection({ polys: [[[0, 0], [P.w, 0], [P.w, P.h], [0, P.h]]] });
+}
+
+/* Выделение прямоугольником */
+
+/**
+ * Протяжка выделения. Внутри выделения без Shift она двигает его, иначе
+ * рисует прямоугольник; с Shift прямоугольник добавляется к прежнему
+ * выделению. Щелчок без протяжки снимает выделение, как в Photoshop.
+ */
+function startMarquee(p, pt, shift) {
+  const P = cur();
+  if (S.lasso) cancelLasso();
+  ui.stage.classList.remove('over-sel');
+  if (P.sel && !shift && insideSel(P.sel, pt)) {
+    S.draw = { kind: 'selmove', start: pt, p0: p, moved: false, polys: P.sel.polys };
+    return;
+  }
+  S.draw = { kind: 'marquee', start: pt, end: pt, p0: p, moved: false, add: shift && !!P.sel };
+}
+
+function dragSel(p, pt) {
+  const d = S.draw;
+  d.moved ||= Math.hypot(p[0] - d.p0[0], p[1] - d.p0[1]) >= MARQUEE_MIN;
+  if (d.kind === 'selmove') {
+    let dx = pt[0] - d.start[0];
+    let dy = pt[1] - d.start[1];
+    // У картинки выделение держится целых пикселей: фрагмент не растёт на пиксель.
+    if (S.src.kind === 'image') [dx, dy] = [Math.round(dx), Math.round(dy)];
+    d.polys = cur().sel.polys.map((poly) => poly.map(([x, y]) => [x + dx, y + dy]));
+  } else {
+    d.end = pt;
+    if (d.moved) renderMeasure(p, marqueeRect(d));
+  }
+  renderSel();
+}
+
+/** Прямоугольник протяжки: в пределах листа, у картинки по целым пикселям. */
+function marqueeRect(d) {
+  const P = cur();
+  const r = [
+    clamp(Math.min(d.start[0], d.end[0]), 0, P.w), clamp(Math.min(d.start[1], d.end[1]), 0, P.h),
+    clamp(Math.max(d.start[0], d.end[0]), 0, P.w), clamp(Math.max(d.start[1], d.end[1]), 0, P.h),
+  ];
+  return S.src.kind === 'image' ? r.map(Math.round) : r;
+}
+
+function endSelDrag(d) {
+  const P = cur();
+  ui.measure.hidden = true;
+  const r = d.kind === 'marquee' && d.moved ? marqueeRect(d) : null;
+  if (d.kind === 'selmove' && d.moved) {
+    setSelection({ polys: d.polys });
+  } else if (r && r[2] > r[0] && r[3] > r[1]) {
+    const poly = [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]];
+    setSelection({ polys: d.add ? [...P.sel.polys, poly] : [poly] });
+  } else if (!d.add) {
+    // Щелчок, протяжка за краем листа или в линию: выделение снимается.
+    setSelection(null);
+  } else {
+    renderSel();
+  }
+}
+
+/** Esc посреди протяжки: выделение остаётся прежним. */
+function cancelSelDrag() {
+  S.draw = null;
+  ui.measure.hidden = true;
+  renderSel();
+}
+
+/** Многоугольники выделения на экране, с протяжкой в работе. */
+function shownPolys(P) {
+  const d = S.draw;
+  const polys = P?.sel?.polys || [];
+  if (d?.kind === 'selmove') return d.polys;
+  if (d?.kind === 'marquee' && d.moved) {
+    const [x0, y0, x1, y1] = marqueeRect(d);
+    return [...(d.add ? polys : []), [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]];
+  }
+  return polys;
+}
+
+/** Точка внутри выделения: внутри хотя бы одного многоугольника. */
+function insideSel(sel, [x, y]) {
+  return sel.polys.some((poly) => {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const [xi, yi] = poly[i];
+      const [xj, yj] = poly[j];
+      if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  });
+}
+
+/** Над выделением протяжка двигает его: курсор показывает это. */
+function markOverSel(p) {
+  const P = cur();
+  const over = !!P?.sel && !S.draw && !S.space && !S.pending && insideSel(P.sel, toSource(p));
+  ui.stage.classList.toggle('over-sel', over);
+}
+
+/**
+ * Размер протянутой рамки у курсора: мм у листа PDF, у картинки пиксели
+ * исходника, как у фрагмента.
+ */
+function renderMeasure(p, [x0, y0, x1, y1]) {
+  const o = S.src.original;
+  const P = cur();
+  // Те же границы, что у фрагмента: рамка в пикселях исходника наружу до целых.
+  const span = (a, b, s, most) => Math.min(most, Math.ceil(b * s)) - Math.floor(a * s);
+  ui.measure.textContent = S.src.kind === 'pdf'
+    ? `${mm(x1 - x0)} × ${mm(y1 - y0)} мм`
+    : o
+      ? `${span(x0, x1, o.w / P.w, o.w)} × ${span(y0, y1, o.h / P.h, o.h)} px`
+      : `${x1 - x0} × ${y1 - y0} px`;
+  ui.measure.style.left = `${p[0] + 14}px`;
+  ui.measure.style.top = `${p[1] + 14}px`;
+  ui.measure.hidden = false;
+}
+
 /** Заливка выделения цветом краски с непрозрачностью краски. */
 function fillSelection() {
   const P = cur();
@@ -1216,7 +1376,7 @@ function renderSel() {
   const [bg, fg, start] = ui.sel.children;
   const line = (pts, closed) => `M${pts.map((v) => toStage(v).map((n) => n.toFixed(1)).join(' ')).join('L')}${closed ? 'Z' : ''}`;
   const parts = [];
-  if (P?.sel) for (const poly of P.sel.polys) parts.push(line(poly, true));
+  for (const poly of shownPolys(P)) parts.push(line(poly, true));
   const L = P ? S.lasso : null;
   if (L) parts.push(line(S.hover ? [...L.points, toSource(S.hover)] : L.points, false));
   const d = parts.join(' ');
@@ -1244,6 +1404,7 @@ const TOOL_HINTS = {
   paint: 'Краска рисует прямо по листу. ⌥ + щелчок берёт цвет с листа.',
   pick: 'Щелчок по листу берёт цвет для краски.',
   lasso: 'Щелчки ставят вершины; замыкают двойной щелчок, Enter или первая вершина. Shift добавляет к выделению, Esc отменяет.',
+  marquee: 'Протяни рамку выделения. Протяжка внутри выделения двигает его, Shift добавляет к нему, ⌘A выделяет всё.',
   hand: 'Рука двигает лист. Пробел включает её из любого инструмента.',
 };
 
@@ -1253,12 +1414,13 @@ function renderOptions() {
   const show = (key, on) => {
     for (const el of ui.options.querySelectorAll(`[data-opt="${key}"]`)) el.hidden = !on;
   };
-  // Кнопки выделения только у лассо: вместе с настройками кисти они не
-  // помещаются в одну строку, и лист прыгал бы при смене инструмента.
+  // Кнопки выделения только у инструментов выделения: вместе с
+  // настройками кисти они не помещаются в одну строку, и лист прыгал бы
+  // при смене инструмента.
   show('size', RING_TOOLS.includes(t));
   show('stroke', t === 'paint' || t === 'stamp');
   show('aligned', t === 'stamp');
-  show('sel', t === 'lasso');
+  show('sel', t === 'lasso' || t === 'marquee');
   show('marks', MARK_TOOLS.includes(t));
   if (t === 'paint' || t === 'stamp') {
     const o = S.opts[t];
@@ -1276,6 +1438,7 @@ function renderOptions() {
   if (P?.sel && (t === 'paint' || t === 'stamp')) hint = `Мазок идёт только внутри выделения, ⌘D снимает его. ${hint}`;
   ui.optHint.textContent = hint;
   ui.optHint.title = hint;
+  renderFragment();
 }
 
 /** Жёсткость или непрозрачность у краски или штампа (у заливки как у краски). */
@@ -1924,6 +2087,7 @@ function showPending() {
   ui.accept.textContent = S.src.kind === 'pdf' ? 'Принять в лист' : 'Принять';
   ui.compare.textContent = 'Показать до';
   ui.compare.classList.remove('active');
+  renderFragment();
 }
 
 function clearPending() {
@@ -1935,6 +2099,7 @@ function clearPending() {
   ui.marks.hidden = false;
   ui.result.hidden = true;
   ui.run.hidden = false;
+  renderFragment();
 }
 
 function toggleCompare() {
@@ -2004,9 +2169,11 @@ async function acceptImage() {
   const k = Math.min(1, IMAGE_EDGE / Math.max(bmp.width, bmp.height));
   const image = blank(bmp.width * k, bmp.height * k);
   image.getContext('2d').drawImage(bmp, 0, 0, image.width, image.height);
+  const original = k < 1 ? { blob: raster, w: bmp.width, h: bmp.height } : null;
   bmp.close?.();
   clearRegions(cur());
   S.src.image = image;
+  S.src.original = original;
   S.pages = [pageState(image.width, image.height)];
   S.accepted = p.record.id;
   clearPending();
@@ -2072,71 +2239,284 @@ function outName(name) {
 /**
  * Окно выбора файла годится не везде. Встроенный браузер приложения Claude
  * (в userAgent есть «Claude/») окно показывает и создаёт пустой файл, а
- * запись в него запрещает. Там PDF сразу скачивается. Если запись не
+ * запись в него запрещает. Там файл сразу скачивается. Если запись не
  * удалась в другом браузере, это запоминается, и дальше он тоже скачивает.
  */
 const LS_NO_PICKER = 'nb.noSavePicker';
 const EMBEDDED = /\bClaude\//.test(navigator.userAgent);
+const SAVE_TYPES = {
+  pdf: { description: 'PDF', accept: { 'application/pdf': ['.pdf'] } },
+  png: { description: 'PNG', accept: { 'image/png': ['.png'] } },
+  jpeg: { description: 'JPEG', accept: { 'image/jpeg': ['.jpg', '.jpeg'] } },
+};
 
 function pickerUsable() {
   if (!window.showSaveFilePicker || EMBEDDED) return false;
   try { return localStorage.getItem(LS_NO_PICKER) !== '1'; } catch { return true; }
 }
 
+/**
+ * Куда записать файл. Окно выбора нужно открыть сразу по нажатию: после
+ * долгой сборки браузер уже не считает действие пользовательским и
+ * откажет. Запись открывается сразу за ним: если её не дают, это видно до
+ * сборки. Без окна файл скачается. null: сохранение отменили.
+ */
+async function pickTarget(name, type) {
+  const t = { writable: null, name: '', refused: '' };
+  if (!pickerUsable()) return t;
+  let handle = null;
+  try {
+    handle = await window.showSaveFilePicker({ suggestedName: name, types: [SAVE_TYPES[type]] });
+  } catch (e) {
+    if (e.name === 'AbortError') return null;
+  }
+  if (handle) {
+    try {
+      t.writable = await handle.createWritable();
+      t.name = handle.name;
+    } catch {
+      try { localStorage.setItem(LS_NO_PICKER, '1'); } catch { /* хранилище недоступно */ }
+      t.refused = ` Браузер не дал записать в «${handle.name}»: там мог остаться пустой файл, его можно удалить.`;
+    }
+  }
+  return t;
+}
+
+/** Файл в выбранное место или в загрузки под именем fallback; ответ: куда он лёг. */
+async function deliver(blob, t, fallback) {
+  if (t.writable) {
+    await t.writable.write(blob);
+    await t.writable.close();
+    return `записан в «${t.name}»`;
+  }
+  download(blob, fallback);
+  return `скачан в папку загрузок как «${fallback}»`;
+}
+
+const sizeText = (bytes) => (bytes < 1048576
+  ? `${Math.max(1, Math.round(bytes / 1024))} КБ`
+  : `${(bytes / 1048576).toFixed(1)} МБ`);
+
 async function savePdf() {
   const src = S.src;
   if (src?.kind !== 'pdf' || !src.patches.length) return;
   if (cur()?.ops.length) { status('На листе непринятое рисование: прими или отмени его, потом сохраняй PDF.', 'error'); return; }
   const name = outName(src.name);
-  // Окно выбора файла нужно открыть сразу по нажатию: после долгой сборки
-  // браузер уже не считает действие пользовательским и откажет. Запись
-  // открывается сразу за ним: если её не дают, это видно до сборки.
-  let writable = null;
-  let target = '';
-  let refused = '';
-  if (pickerUsable()) {
-    let handle = null;
-    try {
-      handle = await window.showSaveFilePicker({
-        suggestedName: name,
-        types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }],
-      });
-    } catch (e) {
-      if (e.name === 'AbortError') { status('Сохранение отменено.'); return; }
-    }
-    if (handle) {
-      try {
-        writable = await handle.createWritable();
-        target = handle.name;
-      } catch {
-        try { localStorage.setItem(LS_NO_PICKER, '1'); } catch { /* хранилище недоступно */ }
-        refused = ` Браузер не дал записать в «${handle.name}»: там мог остаться пустой файл, его можно удалить.`;
-      }
-    }
-  }
+  const target = await pickTarget(name, 'pdf');
+  if (!target) { status('Сохранение отменено.'); return; }
   ui.save.disabled = true;
   status('Собираю PDF…', 'busy');
   try {
     const bytes = await pdfLib.build(src.bytes, src.doc, src.patches);
     const blob = new Blob([bytes], { type: 'application/pdf' });
-    const size = `${(blob.size / 1048576).toFixed(1)} МБ`;
     const count = `${src.patches.length} ${app.plural(src.patches.length, ['правка', 'правки', 'правок'])}`;
-    if (writable) {
-      await writable.write(blob);
-      await writable.close();
-      status(`PDF записан в «${target}» · ${count}, ${size}.`);
-    } else {
-      const fallback = name.replace(/\.pdf$/i, '_nb.pdf');
-      download(blob, fallback);
-      status(`PDF скачан в папку загрузок как «${fallback}» · ${count}, ${size}.${refused}`);
-    }
+    const where = await deliver(blob, target, name.replace(/\.pdf$/i, '_nb.pdf'));
+    status(`PDF ${where} · ${count}, ${sizeText(blob.size)}.${target.refused}`);
   } catch (e) {
     // Незакрытая запись не трогает выбранный файл: она пишет во временный.
-    await writable?.abort?.().catch(() => {});
+    await target.writable?.abort?.().catch(() => {});
     status(e.message || 'PDF не собрался.', 'error');
   } finally {
     ui.save.disabled = false;
   }
+}
+
+/* ── Фрагмент в файл ───────────────────────────────────── */
+// Выделение сохраняется отдельным файлом. Лист PDF: векторным PDF
+// размером с выделение (pdfdoc.fragment) или растром PNG и JPEG в
+// выбранной плотности. Картинка: PNG или JPEG в её родных пикселях. В файл
+// идёт принятое: лист с принятыми правками, без пометок областей и без
+// непринятого рисования. Вне многоугольников выделения фрагмент
+// прозрачный (PNG) или белый (JPEG и PDF).
+
+const FORMAT_NAMES = { pdf: 'PDF', png: 'PNG', jpeg: 'JPEG' };
+const stem = (name) => (name || 'документ').replace(/\.[a-z0-9]{2,5}$/i, '');
+
+function loadFragPrefs() {
+  try {
+    const v = JSON.parse(localStorage.getItem(LS_FRAG) || 'null');
+    if (!v) return;
+    if (['pdf', 'png', 'jpeg'].includes(v.pdf)) S.frag.pdf = v.pdf;
+    if (['png', 'jpeg'].includes(v.image)) S.frag.image = v.image;
+    if (FRAG_DPI.includes(v.dpi)) S.frag.dpi = v.dpi;
+  } catch { /* хранилище недоступно или запись испорчена */ }
+}
+
+function saveFragPrefs() {
+  try { localStorage.setItem(LS_FRAG, JSON.stringify(S.frag)); } catch { /* хранилище недоступно */ }
+}
+
+/**
+ * Что сохранится: рамка выделения на листе (у картинки по целым
+ * пикселям), формат, плотность и размер растра в пикселях. src: рамка в
+ * пикселях исходника картинки. null, если выделение вне листа.
+ */
+function fragmentPlan(P) {
+  const b = P?.sel ? selectionBox(P.sel) : null;
+  if (!b) return null;
+  const pdf = S.src.kind === 'pdf';
+  let box = [Math.max(0, b[0]), Math.max(0, b[1]), Math.min(P.w, b[2]), Math.min(P.h, b[3])];
+  if (!pdf) box = [Math.floor(box[0]), Math.floor(box[1]), Math.ceil(box[2]), Math.ceil(box[3])];
+  const w = box[2] - box[0];
+  const h = box[3] - box[1];
+  if (!(w > 0 && h > 0)) return null;
+  const format = pdf ? S.frag.pdf : S.frag.image;
+  const plan = { box, format, frame: isFrame(P.sel), dpi: 0, k: 1, reduced: false, pw: 0, ph: 0, src: null };
+  if (pdf) {
+    // Растр, который не влезает в пределы холста, ложится в меньшей плотности.
+    const most = Math.floor(Math.min(FRAG_SIDE / Math.max(w, h), Math.sqrt(FRAG_PIXELS / (w * h))) * 72);
+    plan.dpi = Math.min(S.frag.dpi, most);
+    plan.reduced = format !== 'pdf' && plan.dpi < S.frag.dpi;
+    plan.k = plan.dpi / 72;
+    plan.pw = Math.max(1, Math.round(w * plan.k));
+    plan.ph = Math.max(1, Math.round(h * plan.k));
+  } else {
+    const o = S.src.original;
+    const sx = o ? o.w / P.w : 1;
+    const sy = o ? o.h / P.h : 1;
+    plan.src = o
+      ? [Math.floor(box[0] * sx), Math.floor(box[1] * sy), Math.min(o.w, Math.ceil(box[2] * sx)), Math.min(o.h, Math.ceil(box[3] * sy))]
+      : box;
+    plan.pw = plan.src[2] - plan.src[0];
+    plan.ph = plan.src[3] - plan.src[1];
+  }
+  return plan;
+}
+
+function segButton(text, key, value, active) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = text;
+  b.dataset[key] = value;
+  b.classList.toggle('active', active);
+  return b;
+}
+
+/** Блок «Фрагмент в файл»: виден, пока есть выделение и нет ответа на выбор. */
+function renderFragment() {
+  const P = cur();
+  const plan = S.pending ? null : fragmentPlan(P);
+  ui.frag.hidden = !plan;
+  if (!plan) return;
+  const pdf = S.src.kind === 'pdf';
+  const f = plan.format;
+  ui.fragFormat.replaceChildren(...(pdf ? ['pdf', 'png', 'jpeg'] : ['png', 'jpeg'])
+    .map((v) => segButton(FORMAT_NAMES[v], 'format', v, v === f)));
+  ui.fragDpi.hidden = !pdf || f === 'pdf';
+  ui.fragDpi.replaceChildren(...FRAG_DPI.map((d) => segButton(`${d} dpi`, 'dpi', String(d), d === S.frag.dpi)));
+  const [x0, y0, x1, y1] = plan.box;
+  const sheet = `${mm(x1 - x0)} × ${mm(y1 - y0)} мм`;
+  const px = `${plan.pw} × ${plan.ph} px`;
+  ui.fragSize.textContent = pdf ? (f === 'pdf' ? `${sheet} · вектор` : `${sheet} · ${px}`) : px;
+
+  let info;
+  if (pdf && f === 'pdf') {
+    info = 'Страница размером с фрагмент: линии и текст векторные, масштаб листа сохраняется. Лист за краем фрагмента скрыт обрезкой и остаётся в файле.';
+  } else if (pdf) {
+    info = f === 'png'
+      ? `PNG без потерь. В файле записано ${plan.dpi} dpi: в документ фрагмент встанет в своём размере на листе.`
+      : `JPEG легче PNG и даёт ореол у тонких линий: для чертежа чище PNG. В файле записано ${plan.dpi} dpi.`;
+    if (plan.reduced) info = `Для ${S.frag.dpi} dpi фрагмент крупный: сохранится в ${plan.dpi} dpi. ${info}`;
+  } else {
+    const native = S.src.original ? 'в пикселях исходной картинки' : 'в родных пикселях картинки';
+    info = f === 'png' ? `PNG без потерь, ${native}.` : `JPEG, качество ${Math.round(FRAG_JPEG * 100)} %, ${native}.`;
+  }
+  if (!plan.frame) {
+    info += { pdf: ' Вне выделения лист срезан.', png: ' Вне выделения фрагмент прозрачный.', jpeg: ' Вне выделения фрагмент белый.' }[f];
+  }
+  if (P.ops.length) info = `В файл идёт только принятое: прими или отмени рисование. ${info}`;
+  ui.fragInfo.textContent = info;
+  ui.fragSave.disabled = P.ops.length > 0;
+}
+
+function setFragFormat(format) {
+  S.frag[S.src?.kind === 'pdf' ? 'pdf' : 'image'] = format;
+  saveFragPrefs();
+  renderFragment();
+}
+
+function setFragDpi(dpi) {
+  S.frag.dpi = dpi;
+  saveFragPrefs();
+  renderFragment();
+}
+
+/** Имя файла фрагмента: документ, лист, время. Одинаковые имена не затирают друг друга. */
+function fragmentName(format) {
+  const d = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  const when = `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+  const page = S.src.kind === 'pdf' ? `_лист-${S.page + 1}` : '';
+  return `${stem(S.src.name)}${page}_фрагмент_${when}.${format === 'jpeg' ? 'jpg' : format}`;
+}
+
+async function saveFragment() {
+  const P = cur();
+  if (!P || S.loading || S.draw || S.pending) return;
+  if (P.ops.length) { status('На листе непринятое рисование: прими или отмени его, потом сохраняй фрагмент.', 'error'); return; }
+  const plan = fragmentPlan(P);
+  if (!plan) return;
+  const name = fragmentName(plan.format);
+  const target = await pickTarget(name, plan.format);
+  if (!target) { status('Сохранение отменено.'); return; }
+  setLoading(true, plan.format === 'pdf' ? 'Собираю PDF фрагмента…' : `Рисую фрагмент${plan.dpi ? ` в ${plan.dpi} dpi` : ''}…`);
+  try {
+    const blob = await makeFragment(P, plan);
+    const where = await deliver(blob, target, name);
+    const what = plan.format === 'pdf'
+      ? ui.fragSize.textContent.replace(' · вектор', '')
+      : `${plan.pw} × ${plan.ph} px${plan.dpi ? `, ${plan.dpi} dpi` : ''}`;
+    status(`Фрагмент ${FORMAT_NAMES[plan.format]} ${where} · ${what}, ${sizeText(blob.size)}.${target.refused}`);
+  } catch (e) {
+    await target.writable?.abort?.().catch(() => {});
+    status(e.message || 'Фрагмент не сохранился.', 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function makeFragment(P, plan) {
+  const src = S.src;
+  const page = S.page;
+  const polys = plan.frame ? null : P.sel.polys;
+  if (src.kind === 'pdf' && plan.format === 'pdf') {
+    const title = `${stem(src.name)}, лист ${page + 1}, фрагмент`;
+    const bytes = await pdfLib.fragment(src.bytes, src.doc, page, plan.box, polys, patchesOf(page), title);
+    return new Blob([bytes], { type: 'application/pdf' });
+  }
+  let canvas;
+  let map;
+  if (src.kind === 'pdf') {
+    const f = frameOf(plan.k, plan.box[0], plan.box[1], plan.pw, plan.ph);
+    canvas = await src.doc.render(page, f, patchesOf(page));
+    map = ([x, y]) => [(x - f.x) * f.k, (y - f.y) * f.k];
+  } else {
+    [canvas, map] = await imageCrop(P, plan);
+  }
+  if (polys) {
+    const clipped = clipTo(canvas, polys, map);
+    canvas.width = canvas.height = 0;   // растр листа больше не нужен: память сразу назад
+    canvas = clipped;
+  }
+  return encode(canvas, plan.format, plan.dpi);
+}
+
+/** Рамка картинки в её родных пикселях: из исходника, если редактор правит уменьшенную копию. */
+async function imageCrop(P, plan) {
+  const [a, b, c, d] = plan.src;
+  const canvas = blank(c - a, d - b);
+  const ctx = canvas.getContext('2d');
+  const o = S.src.original;
+  if (!o) {
+    ctx.drawImage(S.src.image, a, b, c - a, d - b, 0, 0, c - a, d - b);
+    return [canvas, ([x, y]) => [x - a, y - b]];
+  }
+  const bmp = await createImageBitmap(o.blob);
+  ctx.drawImage(bmp, a, b, c - a, d - b, 0, 0, c - a, d - b);
+  bmp.close?.();
+  const sx = o.w / P.w;
+  const sy = o.h / P.h;
+  return [canvas, ([x, y]) => [x * sx - a, y * sy - b]];
 }
 
 /* ── Миниатюры листов ──────────────────────────────────── */
@@ -2331,6 +2711,16 @@ function bindPanel() {
   ui.deselect.addEventListener('click', thenStage(deselect));
   ui.paintAccept.addEventListener('click', thenStage(acceptPaint));
   ui.paintCancel.addEventListener('click', thenStage(cancelPaint));
+  // Кнопки формата и плотности строятся заново при каждом выборе.
+  ui.fragFormat.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-format]');
+    if (b) thenStage(() => setFragFormat(b.dataset.format))();
+  });
+  ui.fragDpi.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-dpi]');
+    if (b) thenStage(() => setFragDpi(Number(b.dataset.dpi)))();
+  });
+  ui.fragSave.addEventListener('click', thenStage(saveFragment));
   ui.undo.addEventListener('click', undo);
   ui.clear.addEventListener('click', clearMarks);
   ui.zoomIn.addEventListener('click', () => zoomAt(1.25, stageCentre()));
@@ -2373,7 +2763,7 @@ function bindPanel() {
     ui.dialog.close();
   });
   ui.dialog.addEventListener('cancel', (e) => {
-    // Этот Esc уже отменил лассо.
+    // Этот Esc уже отменил лассо или протяжку выделения.
     if (performance.now() - S.escAt < 300) { e.preventDefault(); return; }
     if (S.busy) {
       e.preventDefault();
@@ -2418,8 +2808,15 @@ function onKey(e) {
   // По физическим клавишам: так сочетания работают и в русской раскладке.
   if ((e.metaKey || e.ctrlKey) && e.code === 'KeyZ') { e.preventDefault(); undo(); return; }
   if ((e.metaKey || e.ctrlKey) && e.code === 'KeyD') { e.preventDefault(); deselect(); return; }
+  if ((e.metaKey || e.ctrlKey) && e.code === 'KeyA') { e.preventDefault(); selectAll(); return; }
   if (e.altKey && (e.code === 'Backspace' || e.code === 'Delete')) { e.preventDefault(); fillSelection(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.code === 'Escape' && (S.draw?.kind === 'marquee' || S.draw?.kind === 'selmove')) {
+    e.preventDefault();
+    S.escAt = performance.now();
+    cancelSelDrag();
+    return;
+  }
   if (S.lasso) {
     if (e.code === 'Enter' || e.code === 'NumpadEnter') { e.preventDefault(); closeLasso(); return; }
     if (e.code === 'Escape') { e.preventDefault(); S.escAt = performance.now(); cancelLasso(); return; }
@@ -2437,6 +2834,7 @@ function onKey(e) {
     case 'KeyS': setTool('stamp'); break;
     case 'KeyI': setTool('pick'); break;
     case 'KeyL': setTool('lasso'); break;
+    case 'KeyM': setTool('marquee'); break;
     case 'BracketLeft':
       if (e.shiftKey && stroke) setStroke('hard', S.opts[S.tool].hard - 0.25);
       else setSize(S.size / 1.25);

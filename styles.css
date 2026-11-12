@@ -391,6 +391,7 @@ details .field { margin-top: 10px; }
   outline: none;
 }
 .ed-stage[data-tool="hand"], .ed-stage.grab { cursor: grab; }
+.ed-stage[data-tool="marquee"].over-sel { cursor: move; }
 .ed-stage.panning { cursor: grabbing; }
 .ed-sheet {
   position: absolute;
@@ -448,6 +449,19 @@ details .field { margin-top: 10px; }
 }
 .ed-source::before { left: 9px; top: 0; width: 1px; height: 19px; }
 .ed-source::after { top: 9px; left: 0; width: 19px; height: 1px; }
+/* Размер протягиваемой рамки выделения у курсора */
+.ed-measure {
+  position: absolute;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, .75);
+  color: #fff;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.ed-measure[hidden] { display: none; }
 .ed-loading {
   position: absolute;
   inset: 0;
@@ -545,6 +559,21 @@ details .field { margin-top: 10px; }
 }
 .ed-paint[hidden] { display: none; }
 .ed-paint .hint { margin: 0; }
+
+/* Фрагмент выделения в файл */
+.ed-frag {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.ed-frag[hidden], .ed-frag .seg[hidden] { display: none; }
+.ed-frag .hint { margin: 0; }
+.ed-frag-head { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.ed-frag-size { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 
 .ed-actions { display: flex; gap: 8px; }
 .ed-actions .primary { flex: 1; }

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nano banana</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🍌</text></svg>">
-<link rel="stylesheet" href="styles.css?v=202611111537">
+<link rel="stylesheet" href="styles.css?v=202611120749">
 </head>
 <body>
 
@@ -153,10 +153,11 @@
         </div>
         <div class="swatches" id="ed-colors"></div>
         <span class="ed-sep" aria-hidden="true"></span>
-        <div class="ed-group" title="Рисование прямо по листу">
+        <div class="ed-group" title="Рисование и выделение на листе">
           <button class="ghost small" data-tool="paint" title="Краска: рисует цветом по листу · P">Краска</button>
           <button class="ghost small" data-tool="stamp" title="Штамп: копирует участок листа кистью · S">Штамп</button>
           <button class="ghost small" data-tool="pick" title="Пипетка: цвет краски с листа · I">Пипетка</button>
+          <button class="ghost small" data-tool="marquee" title="Выделение прямоугольником · M. Выделенный фрагмент сохраняется в файл: блок «Фрагмент в файл» справа.">Выделение</button>
           <button class="ghost small" data-tool="lasso" title="Лассо: выделение многоугольником · L. Краска, штамп и заливка рисуют только внутри выделения.">Лассо</button>
         </div>
         <label class="ed-colour" title="Цвет краски">
@@ -216,6 +217,7 @@
           <circle class="ant-start" r="4"></circle>
         </svg>
         <div class="ed-source" id="ed-source" hidden></div>
+        <div class="ed-measure" id="ed-measure" hidden></div>
         <div class="ed-cursor" id="ed-cursor" hidden></div>
         <div class="ed-loading" id="ed-loading" hidden>Загружаю…</div>
         <p class="ed-help">Колесо или два пальца: прокрутка · ⌘ + колесо или щипок: масштаб · пробел + мышь: рука</p>
@@ -237,6 +239,17 @@
           <button class="primary" id="ed-paint-accept">Принять</button>
           <button class="ghost" id="ed-paint-cancel">Отменить рисование</button>
         </div>
+      </div>
+
+      <div class="ed-frag" id="ed-frag" hidden>
+        <div class="ed-frag-head">
+          <span>Фрагмент в файл</span>
+          <span class="ed-frag-size" id="ed-frag-size"></span>
+        </div>
+        <div class="seg" id="ed-frag-format"></div>
+        <div class="seg" id="ed-frag-dpi" hidden></div>
+        <p class="hint" id="ed-frag-info"></p>
+        <button class="primary" id="ed-frag-save">Сохранить фрагмент</button>
       </div>
 
       <div class="field-row">
@@ -316,6 +329,6 @@
   <input type="file" id="ed-ref-input" accept="image/*" multiple hidden>
 </dialog>
 
-<script type="module" src="js/app.js?v=202611111537"></script>
+<script type="module" src="js/app.js?v=202611120749"></script>
 </body>
 </html>
